@@ -93,14 +93,16 @@ async function renderWithSizeFallback(inputArgsBuilder, outputPath) {
     try {
       await encodeWithCrf(inputArgsBuilder, outputPath, crf);
       const sizeMB = getFileSizeMB(outputPath);
-      if (sizeMB <= MAX_FILE_SIZE_MB) return sizeMB;
+      if (sizeMB > 0 && sizeMB <= MAX_FILE_SIZE_MB) return sizeMB;
+      if (sizeMB === 0) {
+        lastErr = new Error('FFmpeg exited without error but produced an empty (0 byte) file — check filter_complex syntax and input validity');
+        continue;
+      }
       lastErr = new Error(`Output still ${sizeMB}MB after CRF ${crf}`);
     } catch (e) {
       lastErr = e;
     }
   }
-  const sizeMB = fs.existsSync(outputPath) ? getFileSizeMB(outputPath) : null;
-  if (sizeMB !== null) return sizeMB; // best effort, return whatever we got
   throw lastErr || new Error('Render failed at all CRF levels');
 }
 
@@ -142,7 +144,7 @@ app.post('/render', async (req, res) => {
     if (mode === '1') {
       // Mode 1: single photo, slow Ken Burns zoom, 15s
       inputArgsBuilder = (crf, out) => {
-        const args = ['-y', '-loop', '1', '-i', mediaPath];
+        const args = ['-y', '-loop', '1', '-framerate', '25', '-i', mediaPath];
         if (musicPath) args.push('-i', musicPath);
         args.push(
           '-filter_complex',
@@ -188,7 +190,7 @@ app.post('/render', async (req, res) => {
       // list once the n8n side is upgraded to capture MediaUrl0..MediaUrl4).
       // Falls back to treating it like Mode 1 with a single photo for now.
       inputArgsBuilder = (crf, out) => {
-        const args = ['-y', '-loop', '1', '-i', mediaPath];
+        const args = ['-y', '-loop', '1', '-framerate', '25', '-i', mediaPath];
         if (musicPath) args.push('-i', musicPath);
         args.push(
           '-filter_complex',
