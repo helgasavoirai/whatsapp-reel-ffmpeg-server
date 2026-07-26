@@ -1,0 +1,14 @@
+{
+  "name": "whatsapp-reel-ffmpeg-server",
+  "version": "1.0.0",
+  "description": "Render server untuk WhatsApp Product Video Reel Generator (Week 2)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "axios": "^1.7.2",
+    "fluent-ffmpeg": "^2.1.3"
+  }
+}
