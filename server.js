@@ -19,6 +19,9 @@ const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
 const MAX_FILE_SIZE_MB = 16;
 const TARGET_DURATION = 15;
+const FFMPEG_THREADS = '2'; // Railway containers report far more CPUs than they
+// actually get; leaving FFmpeg to auto-detect (e.g. 60 threads) causes huge
+// memory overhead and the process gets OOM-killed mid-render.
 
 // --- Font selection per language (file names must exist in /fonts) ---
 // Falls back to a common system font, and finally to `null` (meaning:
@@ -152,7 +155,7 @@ app.post('/render', async (req, res) => {
           `${withOverlay(`[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fade=t=in:st=0:d=1`)}[v]`,
           '-map', '[v]'
         );
-        const outputArgs = ['-t', String(TARGET_DURATION), '-c:v', 'libx264', '-preset', 'fast', '-crf', String(crf), '-pix_fmt', 'yuv420p'];
+        const outputArgs = ['-t', String(TARGET_DURATION), '-c:v', 'libx264', '-preset', 'fast', '-crf', String(crf), '-threads', FFMPEG_THREADS, '-pix_fmt', 'yuv420p'];
         if (musicPath) {
           args.push('-map', '1:a', '-shortest');
           outputArgs.push('-c:a', 'aac', '-b:a', '128k');
@@ -171,7 +174,7 @@ app.post('/render', async (req, res) => {
           `eq=contrast=1.08:saturation=1.15`)}[v]`,
           '-map', '[v]'
         );
-        const outputArgs = ['-t', String(TARGET_DURATION), '-c:v', 'libx264', '-preset', 'fast', '-crf', String(crf), '-pix_fmt', 'yuv420p'];
+        const outputArgs = ['-t', String(TARGET_DURATION), '-c:v', 'libx264', '-preset', 'fast', '-crf', String(crf), '-threads', FFMPEG_THREADS, '-pix_fmt', 'yuv420p'];
         if (musicPath) {
           args.push('-map', '0:a?', '-map', '1:a', '-filter_complex:a', 'amix=inputs=2:duration=first:dropout_transition=2[a]', '-map', '[a]');
           outputArgs.push('-c:a', 'aac', '-b:a', '128k');
@@ -191,7 +194,7 @@ app.post('/render', async (req, res) => {
           `${withOverlay(`[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fade=t=in:st=0:d=1`)}[v]`,
           '-map', '[v]'
         );
-        const outputArgs = ['-t', String(TARGET_DURATION), '-c:v', 'libx264', '-preset', 'fast', '-crf', String(crf), '-pix_fmt', 'yuv420p'];
+        const outputArgs = ['-t', String(TARGET_DURATION), '-c:v', 'libx264', '-preset', 'fast', '-crf', String(crf), '-threads', FFMPEG_THREADS, '-pix_fmt', 'yuv420p'];
         if (musicPath) {
           args.push('-map', '1:a', '-shortest');
           outputArgs.push('-c:a', 'aac', '-b:a', '128k');
