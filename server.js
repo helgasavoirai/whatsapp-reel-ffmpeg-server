@@ -63,14 +63,20 @@ async function downloadFile(url, destPath) {
   return destPath;
 }
 
-// Escape text for FFmpeg drawtext filter (value is wrapped in single quotes).
-// Inside a single-quoted filtergraph value, a literal apostrophe must be
-// written as '\'' (close quote, escaped quote, reopen quote) — a plain
-// backslash-escape does NOT work here and corrupts the rest of the filter.
+// Escape text for FFmpeg's drawtext filter argument.
+// IMPORTANT: we call ffmpeg directly via execFile (no shell involved), so
+// FFmpeg's filtergraph parser sees this string exactly as written — no
+// shell-level escaping tricks apply here (the '\'' bash trick does NOT
+// work and corrupts the filter). We escape special chars with a single
+// backslash and do NOT wrap the value in quotes.
 function escapeDrawtext(text) {
   return String(text || '')
     .replace(/\\/g, '\\\\')
-    .replace(/'/g, "'\\''");
+    .replace(/:/g, '\\:')
+    .replace(/'/g, "\\'")
+    .replace(/,/g, '\\,')
+    .replace(/\[/g, '\\[')
+    .replace(/\]/g, '\\]');
 }
 
 function getFileSizeMB(filePath) {
@@ -134,9 +140,9 @@ app.post('/render', async (req, res) => {
 
     // If no font is available yet, skip the overlay instead of failing the render.
     const drawtextFilter = fontPath
-      ? `drawtext=fontfile='${fontPath}':text='${productText}':fontcolor=white:fontsize=64:` +
+      ? `drawtext=fontfile='${fontPath}':text=${productText}:fontcolor=white:fontsize=64:` +
         `x=(w-text_w)/2:y=h-320:box=1:boxcolor=black@0.5:boxborderw=20,` +
-        `drawtext=fontfile='${fontPath}':text='${taglineText}':fontcolor=white:fontsize=40:` +
+        `drawtext=fontfile='${fontPath}':text=${taglineText}:fontcolor=white:fontsize=40:` +
         `x=(w-text_w)/2:y=h-220:box=1:boxcolor=black@0.4:boxborderw=16`
       : null;
     // Helper to append a filter to a filter-chain label only if it exists
