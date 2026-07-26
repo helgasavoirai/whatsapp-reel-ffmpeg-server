@@ -79,6 +79,14 @@ function escapeDrawtext(text) {
     .replace(/\]/g, '\\]');
 }
 
+// Escape a file path for use inside a single-quoted filtergraph value.
+// Paths we generate ourselves never contain apostrophes, but this keeps
+// things safe if that ever changes (e.g. a workDir name derived from
+// user input in the future).
+function escapePath(p) {
+  return String(p).replace(/\\/g, '\\\\').replace(/'/g, "'\\\\''");
+}
+
 function getFileSizeMB(filePath) {
   const stats = fs.statSync(filePath);
   return +(stats.size / (1024 * 1024)).toFixed(2);
@@ -134,15 +142,25 @@ app.post('/render', async (req, res) => {
       ? path.join(MUSIC_DIR, music) : null;
     if (music && !musicPath) console.warn(`Music file not found: ${music} — rendering without audio track.`);
     const fontPath = fontForLanguage(language);
-    const productText = escapeDrawtext(product_name);
-    const taglineText = escapeDrawtext(tagline);
     const outputPath = path.join(OUTPUT_DIR, `reel-${jobId}.mp4`);
+
+    // Write overlay text to temp files and use drawtext's `textfile=` option
+    // instead of `text=`. This sidesteps ALL filtergraph escaping headaches
+    // (apostrophes, colons, commas, quotes) since the file's raw content is
+    // read verbatim — only the file PATH needs escaping, and we control that
+    // path so it never contains special characters.
+    const productTextPath = path.join(workDir, 'product_name.txt');
+    const taglineTextPath = path.join(workDir, 'tagline.txt');
+    fs.writeFileSync(productTextPath, String(product_name || ''));
+    fs.writeFileSync(taglineTextPath, String(tagline || ''));
+    const escapedProductPath = escapePath(productTextPath);
+    const escapedTaglinePath = escapePath(taglineTextPath);
 
     // If no font is available yet, skip the overlay instead of failing the render.
     const drawtextFilter = fontPath
-      ? `drawtext=fontfile='${fontPath}':text=${productText}:fontcolor=white:fontsize=64:` +
+      ? `drawtext=fontfile='${fontPath}':textfile='${escapedProductPath}':fontcolor=white:fontsize=64:` +
         `x=(w-text_w)/2:y=h-320:box=1:boxcolor=black@0.5:boxborderw=20,` +
-        `drawtext=fontfile='${fontPath}':text=${taglineText}:fontcolor=white:fontsize=40:` +
+        `drawtext=fontfile='${fontPath}':textfile='${escapedTaglinePath}':fontcolor=white:fontsize=40:` +
         `x=(w-text_w)/2:y=h-220:box=1:boxcolor=black@0.4:boxborderw=16`
       : null;
     // Helper to append a filter to a filter-chain label only if it exists
