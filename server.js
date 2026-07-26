@@ -60,12 +60,14 @@ async function downloadFile(url, destPath) {
   return destPath;
 }
 
-// Escape text for FFmpeg drawtext filter
+// Escape text for FFmpeg drawtext filter (value is wrapped in single quotes).
+// Inside a single-quoted filtergraph value, a literal apostrophe must be
+// written as '\'' (close quote, escaped quote, reopen quote) — a plain
+// backslash-escape does NOT work here and corrupts the rest of the filter.
 function escapeDrawtext(text) {
   return String(text || '')
-    .replace(/\\/g, '\\\\\\\\')
-    .replace(/:/g, '\\:')
-    .replace(/'/g, "\\'");
+    .replace(/\\/g, '\\\\')
+    .replace(/'/g, "'\\''");
 }
 
 function getFileSizeMB(filePath) {
