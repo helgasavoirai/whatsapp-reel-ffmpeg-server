@@ -142,24 +142,22 @@ app.post('/render', async (req, res) => {
     let inputArgsBuilder;
 
     if (mode === '1') {
-      // Mode 1: single photo, slow Ken Burns zoom, 15s
+      // Mode 1: single photo, gentle fade-in (lightweight — zoompan was too
+      // CPU-heavy for Railway's shared CPU and caused renders to time out).
       inputArgsBuilder = (crf, out) => {
         const args = ['-y', '-loop', '1', '-framerate', '25', '-i', mediaPath];
         if (musicPath) args.push('-i', musicPath);
         args.push(
           '-filter_complex',
-          `${withOverlay(`[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,` +
-          `zoompan=z='min(zoom+0.0015,1.3)':d=${TARGET_DURATION * 25}:s=1080x1920:fps=25`)}[v]`,
+          `${withOverlay(`[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fade=t=in:st=0:d=1`)}[v]`,
           '-map', '[v]'
         );
-        if (musicPath) { args.push('-map', '1:a', '-shortest'); }
-        args.push(
-          '-t', String(TARGET_DURATION),
-          '-c:v', 'libx264', '-preset', 'fast', '-crf', String(crf),
-          '-pix_fmt', 'yuv420p',
-          '-c:a', 'aac', '-b:a', '128k',
-          out
-        );
+        const outputArgs = ['-t', String(TARGET_DURATION), '-c:v', 'libx264', '-preset', 'fast', '-crf', String(crf), '-pix_fmt', 'yuv420p'];
+        if (musicPath) {
+          args.push('-map', '1:a', '-shortest');
+          outputArgs.push('-c:a', 'aac', '-b:a', '128k');
+        }
+        args.push(...outputArgs, out);
         return args;
       };
     } else if (mode === '3') {
@@ -173,16 +171,12 @@ app.post('/render', async (req, res) => {
           `eq=contrast=1.08:saturation=1.15`)}[v]`,
           '-map', '[v]'
         );
+        const outputArgs = ['-t', String(TARGET_DURATION), '-c:v', 'libx264', '-preset', 'fast', '-crf', String(crf), '-pix_fmt', 'yuv420p'];
         if (musicPath) {
           args.push('-map', '0:a?', '-map', '1:a', '-filter_complex:a', 'amix=inputs=2:duration=first:dropout_transition=2[a]', '-map', '[a]');
+          outputArgs.push('-c:a', 'aac', '-b:a', '128k');
         }
-        args.push(
-          '-t', String(TARGET_DURATION),
-          '-c:v', 'libx264', '-preset', 'fast', '-crf', String(crf),
-          '-pix_fmt', 'yuv420p',
-          '-c:a', 'aac', '-b:a', '128k',
-          out
-        );
+        args.push(...outputArgs, out);
         return args;
       };
     } else {
@@ -197,14 +191,12 @@ app.post('/render', async (req, res) => {
           `${withOverlay(`[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fade=t=in:st=0:d=1`)}[v]`,
           '-map', '[v]'
         );
-        if (musicPath) { args.push('-map', '1:a', '-shortest'); }
-        args.push(
-          '-t', String(TARGET_DURATION),
-          '-c:v', 'libx264', '-preset', 'fast', '-crf', String(crf),
-          '-pix_fmt', 'yuv420p',
-          '-c:a', 'aac', '-b:a', '128k',
-          out
-        );
+        const outputArgs = ['-t', String(TARGET_DURATION), '-c:v', 'libx264', '-preset', 'fast', '-crf', String(crf), '-pix_fmt', 'yuv420p'];
+        if (musicPath) {
+          args.push('-map', '1:a', '-shortest');
+          outputArgs.push('-c:a', 'aac', '-b:a', '128k');
+        }
+        args.push(...outputArgs, out);
         return args;
       };
     }
