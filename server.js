@@ -21,11 +21,31 @@ const MAX_FILE_SIZE_MB = 16;
 const TARGET_DURATION = 15;
 
 // --- Font selection per language (file names must exist in /fonts) ---
+// Falls back to a common system font, and finally to `null` (meaning:
+// skip the text overlay entirely) so rendering never hard-fails just
+// because the font files haven't been uploaded yet.
+const SYSTEM_FONT_FALLBACKS = [
+  '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+  '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+  '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf'
+];
+
 function fontForLanguage(language) {
   const lang = (language || '').toLowerCase();
-  if (lang.includes('hindi')) return path.join(FONTS_DIR, 'NotoSansDevanagari-Regular.ttf');
-  if (lang.includes('gujarati')) return path.join(FONTS_DIR, 'NotoSansGujarati-Regular.ttf');
-  return path.join(FONTS_DIR, 'NotoSans-Regular.ttf');
+  let preferred;
+  if (lang.includes('hindi')) preferred = path.join(FONTS_DIR, 'NotoSansDevanagari-Regular.ttf');
+  else if (lang.includes('gujarati')) preferred = path.join(FONTS_DIR, 'NotoSansGujarati-Regular.ttf');
+  else preferred = path.join(FONTS_DIR, 'NotoSans-Regular.ttf');
+
+  if (fs.existsSync(preferred)) return preferred;
+  for (const fallback of SYSTEM_FONT_FALLBACKS) {
+    if (fs.existsSync(fallback)) {
+      console.warn(`Font not found at ${preferred}, using system fallback ${fallback}`);
+      return fallback;
+    }
+  }
+  console.warn(`No usable font found for language "${language}" — text overlay will be skipped.`);
+  return null;
 }
 
 // --- Download a file from a Twilio media URL (needs Basic Auth) ---
@@ -97,17 +117,23 @@ app.post('/render', async (req, res) => {
     const mediaPath = path.join(workDir, 'media_input');
     await downloadFile(media_url, mediaPath);
 
-    const musicPath = music ? path.join(MUSIC_DIR, music) : null;
+    const musicPath = music && fs.existsSync(path.join(MUSIC_DIR, music))
+      ? path.join(MUSIC_DIR, music) : null;
+    if (music && !musicPath) console.warn(`Music file not found: ${music} — rendering without audio track.`);
     const fontPath = fontForLanguage(language);
     const productText = escapeDrawtext(product_name);
     const taglineText = escapeDrawtext(tagline);
     const outputPath = path.join(OUTPUT_DIR, `reel-${jobId}.mp4`);
 
-    const drawtextFilter =
-      `drawtext=fontfile='${fontPath}':text='${productText}':fontcolor=white:fontsize=64:` +
-      `x=(w-text_w)/2:y=h-320:box=1:boxcolor=black@0.5:boxborderw=20,` +
-      `drawtext=fontfile='${fontPath}':text='${taglineText}':fontcolor=white:fontsize=40:` +
-      `x=(w-text_w)/2:y=h-220:box=1:boxcolor=black@0.4:boxborderw=16`;
+    // If no font is available yet, skip the overlay instead of failing the render.
+    const drawtextFilter = fontPath
+      ? `drawtext=fontfile='${fontPath}':text='${productText}':fontcolor=white:fontsize=64:` +
+        `x=(w-text_w)/2:y=h-320:box=1:boxcolor=black@0.5:boxborderw=20,` +
+        `drawtext=fontfile='${fontPath}':text='${taglineText}':fontcolor=white:fontsize=40:` +
+        `x=(w-text_w)/2:y=h-220:box=1:boxcolor=black@0.4:boxborderw=16`
+      : null;
+    // Helper to append a filter to a filter-chain label only if it exists
+    const withOverlay = (baseFilter) => drawtextFilter ? `${baseFilter},${drawtextFilter}` : baseFilter;
 
     let inputArgsBuilder;
 
@@ -118,8 +144,8 @@ app.post('/render', async (req, res) => {
         if (musicPath) args.push('-i', musicPath);
         args.push(
           '-filter_complex',
-          `[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,` +
-          `zoompan=z='min(zoom+0.0015,1.3)':d=${TARGET_DURATION * 25}:s=1080x1920:fps=25,${drawtextFilter}[v]`,
+          `${withOverlay(`[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,` +
+          `zoompan=z='min(zoom+0.0015,1.3)':d=${TARGET_DURATION * 25}:s=1080x1920:fps=25`)}[v]`,
           '-map', '[v]'
         );
         if (musicPath) { args.push('-map', '1:a', '-shortest'); }
@@ -139,8 +165,8 @@ app.post('/render', async (req, res) => {
         if (musicPath) args.push('-i', musicPath);
         args.push(
           '-filter_complex',
-          `[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,` +
-          `eq=contrast=1.08:saturation=1.15,${drawtextFilter}[v]`,
+          `${withOverlay(`[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,` +
+          `eq=contrast=1.08:saturation=1.15`)}[v]`,
           '-map', '[v]'
         );
         if (musicPath) {
@@ -164,7 +190,7 @@ app.post('/render', async (req, res) => {
         if (musicPath) args.push('-i', musicPath);
         args.push(
           '-filter_complex',
-          `[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fade=t=in:st=0:d=1,${drawtextFilter}[v]`,
+          `${withOverlay(`[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fade=t=in:st=0:d=1`)}[v]`,
           '-map', '[v]'
         );
         if (musicPath) { args.push('-map', '1:a', '-shortest'); }
@@ -194,6 +220,7 @@ app.post('/render', async (req, res) => {
       fileSizeMB
     });
   } catch (err) {
+    console.error('Render failed:', err.stack || err.message || err);
     fs.rmSync(workDir, { recursive: true, force: true });
     return res.status(500).json({ error: err.message || 'Render failed' });
   }
