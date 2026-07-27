@@ -169,14 +169,21 @@ app.post('/render', async (req, res) => {
     let inputArgsBuilder;
 
     if (mode === '1') {
-      // Mode 1: single photo, gentle fade-in (lightweight — zoompan was too
-      // CPU-heavy for Railway's shared CPU and caused renders to time out).
+      // Mode 1: single photo, slow Ken-Burns-style pan (lightweight version).
+      // Full `zoompan` re-samples the whole frame every output frame and
+      // OOM-killed the Railway container. A `crop` with a time-varying
+      // offset is far cheaper — it just shifts which pixels are read, no
+      // per-frame rescaling — so it gives a similar "alive" feel safely.
       inputArgsBuilder = (crf, out) => {
         const args = ['-y', '-loop', '1', '-framerate', '25', '-i', mediaPath];
         if (musicPath) args.push('-i', musicPath);
         args.push(
           '-filter_complex',
-          `${withOverlay(`[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fade=t=in:st=0:d=1`)}[v]`,
+          `${withOverlay(
+            `[0:v]scale=1188:2112:force_original_aspect_ratio=increase,crop=1188:2112,` +
+            `crop=1080:1920:x='(in_w-1080)*min(t/${TARGET_DURATION},1)':y='(in_h-1920)/2',` +
+            `fade=t=in:st=0:d=1`
+          )}[v]`,
           '-map', '[v]'
         );
         const outputArgs = ['-t', String(TARGET_DURATION), '-c:v', 'libx264', '-preset', 'fast', '-crf', String(crf), '-threads', FFMPEG_THREADS, '-pix_fmt', 'yuv420p'];
