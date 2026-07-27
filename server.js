@@ -180,7 +180,7 @@ app.post('/render', async (req, res) => {
         args.push(
           '-filter_complex',
           `${withOverlay(
-            `[0:v]scale=1188:2112:force_original_aspect_ratio=increase,crop=1188:2112,` +
+            `[0:v]scale=1350:2400:force_original_aspect_ratio=increase,crop=1350:2400,` +
             `crop=1080:1920:x='(in_w-1080)*min(t/${TARGET_DURATION},1)':y='(in_h-1920)/2',` +
             `fade=t=in:st=0:d=1`
           )}[v]`,
