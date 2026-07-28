@@ -204,7 +204,14 @@ app.post('/render', async (req, res) => {
       console.log(`Mode 2: ${n} photos received`);
 
       const xfadeDur = 0.5; // per Trello spec: 0.5s cross-fade
-      const holdDur = n > 1 ? (TARGET_DURATION - xfadeDur * (n - 1)) / n : TARGET_DURATION;
+      // For a chain of N xfade stages, each stage's output duration is
+      // (offset + duration of the incoming clip). With offset_k = k*holdDur,
+      // the FINAL total works out to n*holdDur + xfadeDur -- only one
+      // transition's worth gets added overall, not (n-1) of them. The old
+      // formula subtracted xfadeDur*(n-1) up front, which under-shot the
+      // target duration more and more as photo count grew (5 photos ->
+      // ~13.5s instead of 15s). Solving n*holdDur + xfadeDur = TARGET_DURATION:
+      const holdDur = n > 1 ? (TARGET_DURATION - xfadeDur) / n : TARGET_DURATION;
       const clipDur = n > 1 ? holdDur + xfadeDur : TARGET_DURATION;
 
       const photoPaths = [];
