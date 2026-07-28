@@ -144,6 +144,13 @@ app.post('/render', async (req, res) => {
       : null;
     const withOverlay = (baseFilter) => drawtextFilter ? `${baseFilter},${drawtextFilter}` : baseFilter;
 
+    // Music fade in/out (1s each), applied identically across Mode 1, 2, and 3.
+    // inputIndex is the ffmpeg input number of the music track for that mode.
+    function audioFadeFilter(inputIndex) {
+      const fadeOutStart = Math.max(TARGET_DURATION - 1, 0);
+      return `[${inputIndex}:a]afade=t=in:st=0:d=1,afade=t=out:st=${fadeOutStart}:d=1[a]`;
+    }
+
     let inputArgsBuilder;
 
     if (modeStr === '1') {
@@ -154,21 +161,21 @@ app.post('/render', async (req, res) => {
       inputArgsBuilder = (crf, out) => {
         const args = ['-y', '-loop', '1', '-framerate', '25', '-i', mediaPath];
         if (musicPath) args.push('-i', musicPath);
-        args.push(
-          '-filter_complex',
-          `${withOverlay(
-            `[0:v]scale=1620:2880:force_original_aspect_ratio=increase,crop=1620:2880,` +
-            `zoompan=z='min(zoom+0.0008\\,1.2)':` +
-            `x='(iw-iw/zoom)*(on/${totalFrames - 1})':` +
-            `y='(ih-ih/zoom)/2':` +
-            `d=${totalFrames}:s=1080x1920:fps=25,` +
-            `fade=t=in:st=0:d=1`
-          )}[v]`,
-          '-map', '[v]'
-        );
+        const videoFilter = `${withOverlay(
+          `[0:v]scale=1620:2880:force_original_aspect_ratio=increase,crop=1620:2880,` +
+          `zoompan=z='min(zoom+0.0008\\,1.2)':` +
+          `x='(iw-iw/zoom)*(on/${totalFrames - 1})':` +
+          `y='(ih-ih/zoom)/2':` +
+          `d=${totalFrames}:s=1080x1920:fps=25,` +
+          `fade=t=in:st=0:d=1`
+        )}[v]`;
+        const filterChain = musicPath
+          ? `${videoFilter};${audioFadeFilter(1)}`
+          : videoFilter;
+        args.push('-filter_complex', filterChain, '-map', '[v]');
         const outputArgs = ['-t', String(TARGET_DURATION), '-c:v', 'libx264', '-preset', 'fast', '-crf', String(crf), '-threads', FFMPEG_THREADS, '-pix_fmt', 'yuv420p'];
         if (musicPath) {
-          args.push('-map', '1:a', '-shortest');
+          args.push('-map', '[a]', '-shortest');
           outputArgs.push('-c:a', 'aac', '-b:a', '128k');
         }
         args.push(...outputArgs, out);
@@ -181,15 +188,17 @@ app.post('/render', async (req, res) => {
       inputArgsBuilder = (crf, out) => {
         const args = ['-y', '-i', mediaPath];
         if (musicPath) args.push('-i', musicPath);
-        args.push(
-          '-filter_complex',
-          `${withOverlay(`[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,` +
-          `eq=contrast=1.08:saturation=1.15`)}[v]`,
-          '-map', '[v]'
-        );
+        const videoFilter = `${withOverlay(`[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,` +
+          `eq=contrast=1.08:saturation=1.15`)}[v]`;
+        // Fade only the MUSIC track (not the product's own voice/audio) in
+        // and out, then mix it with the video's original audio.
+        const filterChain = musicPath
+          ? `${videoFilter};[1:a]afade=t=in:st=0:d=1,afade=t=out:st=${Math.max(TARGET_DURATION - 1, 0)}:d=1[music_faded];[0:a][music_faded]amix=inputs=2:duration=first:dropout_transition=2[a]`
+          : videoFilter;
+        args.push('-filter_complex', filterChain, '-map', '[v]');
         const outputArgs = ['-t', String(TARGET_DURATION), '-c:v', 'libx264', '-preset', 'fast', '-crf', String(crf), '-threads', FFMPEG_THREADS, '-pix_fmt', 'yuv420p'];
         if (musicPath) {
-          args.push('-map', '0:a?', '-map', '1:a', '-filter_complex:a', 'amix=inputs=2:duration=first:dropout_transition=2[a]', '-map', '[a]');
+          args.push('-map', '[a]');
           outputArgs.push('-c:a', 'aac', '-b:a', '128k');
         }
         args.push(...outputArgs, out);
@@ -249,10 +258,11 @@ app.post('/render', async (req, res) => {
           filterParts.push(`[${prevLabel}]null[v]`);
         }
 
+        if (musicPath) filterParts.push(audioFadeFilter(n));
         args.push('-filter_complex', filterParts.join(';'), '-map', '[v]');
         const outputArgs = ['-t', String(TARGET_DURATION), '-c:v', 'libx264', '-preset', 'fast', '-crf', String(crf), '-threads', FFMPEG_THREADS, '-pix_fmt', 'yuv420p'];
         if (musicPath) {
-          args.push('-map', `${n}:a`, '-shortest');
+          args.push('-map', '[a]', '-shortest');
           outputArgs.push('-c:a', 'aac', '-b:a', '128k');
         }
         args.push(...outputArgs, out);
@@ -265,14 +275,12 @@ app.post('/render', async (req, res) => {
       inputArgsBuilder = (crf, out) => {
         const args = ['-y', '-loop', '1', '-framerate', '25', '-i', mediaPath];
         if (musicPath) args.push('-i', musicPath);
-        args.push(
-          '-filter_complex',
-          `${withOverlay(`[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fade=t=in:st=0:d=1`)}[v]`,
-          '-map', '[v]'
-        );
+        const videoFilter = `${withOverlay(`[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fade=t=in:st=0:d=1`)}[v]`;
+        const filterChain = musicPath ? `${videoFilter};${audioFadeFilter(1)}` : videoFilter;
+        args.push('-filter_complex', filterChain, '-map', '[v]');
         const outputArgs = ['-t', String(TARGET_DURATION), '-c:v', 'libx264', '-preset', 'fast', '-crf', String(crf), '-threads', FFMPEG_THREADS, '-pix_fmt', 'yuv420p'];
         if (musicPath) {
-          args.push('-map', '1:a', '-shortest');
+          args.push('-map', '[a]', '-shortest');
           outputArgs.push('-c:a', 'aac', '-b:a', '128k');
         }
         args.push(...outputArgs, out);
