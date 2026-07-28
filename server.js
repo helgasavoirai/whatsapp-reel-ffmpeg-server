@@ -19,14 +19,8 @@ const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
 const MAX_FILE_SIZE_MB = 16;
 const TARGET_DURATION = 15;
-const FFMPEG_THREADS = '2'; // Railway containers report far more CPUs than they
-// actually get; leaving FFmpeg to auto-detect (e.g. 60 threads) causes huge
-// memory overhead and the process gets OOM-killed mid-render.
+const FFMPEG_THREADS = '2';
 
-// --- Font selection per language (file names must exist in /fonts) ---
-// Falls back to a common system font, and finally to `null` (meaning:
-// skip the text overlay entirely) so rendering never hard-fails just
-// because the font files haven't been uploaded yet.
 const SYSTEM_FONT_FALLBACKS = [
   '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
   '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
@@ -51,7 +45,6 @@ function fontForLanguage(language) {
   return null;
 }
 
-// --- Download a file from a Twilio media URL (needs Basic Auth) ---
 async function downloadFile(url, destPath) {
   const response = await axios.get(url, {
     responseType: 'arraybuffer',
@@ -63,12 +56,6 @@ async function downloadFile(url, destPath) {
   return destPath;
 }
 
-// Escape text for FFmpeg's drawtext filter argument.
-// IMPORTANT: we call ffmpeg directly via execFile (no shell involved), so
-// FFmpeg's filtergraph parser sees this string exactly as written — no
-// shell-level escaping tricks apply here (the '\'' bash trick does NOT
-// work and corrupts the filter). We escape special chars with a single
-// backslash and do NOT wrap the value in quotes.
 function escapeDrawtext(text) {
   return String(text || '')
     .replace(/\\/g, '\\\\')
@@ -79,10 +66,6 @@ function escapeDrawtext(text) {
     .replace(/\]/g, '\\]');
 }
 
-// Escape a file path for use inside a single-quoted filtergraph value.
-// Paths we generate ourselves never contain apostrophes, but this keeps
-// things safe if that ever changes (e.g. a workDir name derived from
-// user input in the future).
 function escapePath(p) {
   return String(p).replace(/\\/g, '\\\\').replace(/'/g, "'\\\\''");
 }
@@ -92,10 +75,10 @@ function getFileSizeMB(filePath) {
   return +(stats.size / (1024 * 1024)).toFixed(2);
 }
 
-// Re-encode at a given CRF to hit the size target
 function encodeWithCrf(inputArgsBuilder, outputPath, crf) {
   return new Promise((resolve, reject) => {
     const args = inputArgsBuilder(crf, outputPath);
+    console.log('FFMPEG ARGS:', JSON.stringify(args)); // debug: shows in Railway Deploy Logs
     execFile('ffmpeg', args, { maxBuffer: 1024 * 1024 * 50 }, (err, stdout, stderr) => {
       if (err) return reject(new Error(stderr || err.message));
       resolve(outputPath);
@@ -112,7 +95,7 @@ async function renderWithSizeFallback(inputArgsBuilder, outputPath) {
       const sizeMB = getFileSizeMB(outputPath);
       if (sizeMB > 0 && sizeMB <= MAX_FILE_SIZE_MB) return sizeMB;
       if (sizeMB === 0) {
-        lastErr = new Error('FFmpeg exited without error but produced an empty (0 byte) file — check filter_complex syntax and input validity');
+        lastErr = new Error('FFmpeg exited without error but produced an empty (0 byte) file');
         continue;
       }
       lastErr = new Error(`Output still ${sizeMB}MB after CRF ${crf}`);
@@ -130,6 +113,10 @@ app.post('/render', async (req, res) => {
 
   try {
     const { mode, media_url, audio_url, music, product_name, price, tagline, language } = req.body;
+    // mode can arrive as the STRING "1" or the NUMBER 1 (Google Sheets
+    // auto-converts numeric-looking cells) — always normalize before branching.
+    const modeStr = String(mode);
+    console.log('RENDER REQUEST mode(raw)=', JSON.stringify(mode), 'modeStr=', modeStr);
 
     if (!mode || !media_url) {
       return res.status(400).json({ error: 'mode and media_url are required' });
@@ -144,11 +131,6 @@ app.post('/render', async (req, res) => {
     const fontPath = fontForLanguage(language);
     const outputPath = path.join(OUTPUT_DIR, `reel-${jobId}.mp4`);
 
-    // Write overlay text to temp files and use drawtext's `textfile=` option
-    // instead of `text=`. This sidesteps ALL filtergraph escaping headaches
-    // (apostrophes, colons, commas, quotes) since the file's raw content is
-    // read verbatim — only the file PATH needs escaping, and we control that
-    // path so it never contains special characters.
     const productTextPath = path.join(workDir, 'product_name.txt');
     const priceTextPath = path.join(workDir, 'price.txt');
     const taglineTextPath = path.join(workDir, 'tagline.txt');
@@ -159,39 +141,29 @@ app.post('/render', async (req, res) => {
     const escapedPricePath = escapePath(priceTextPath);
     const escapedTaglinePath = escapePath(taglineTextPath);
 
-    // If no font is available yet, skip the overlay instead of failing the render.
-    // No boxcolor/box=1 anymore — border + shadow keep text readable without
-    // the flat grey rectangle. enable='gte(t,N)' makes each line appear at
-    // its own timestamp per the Trello timing spec (name 2s, price 5s,
-    // tagline 8s) and then stay visible until the end.
+    function animatedTextFilter(textfilePath, fontSize, baseY, appearAt, animDur, slideDist) {
+      const yExpr = `h-${baseY}+${slideDist}*(1-min(max((t-${appearAt})/${animDur}\\,0)\\,1))`;
+      const alphaExpr = `if(lt(t\\,${appearAt})\\,0\\,min((t-${appearAt})/${animDur}\\,1))`;
+      return `drawtext=fontfile='${fontPath}':textfile='${textfilePath}':fontcolor=white:fontsize=${fontSize}:` +
+        `x=(w-text_w)/2:y='${yExpr}':` +
+        `borderw=3:bordercolor=black@0.85:shadowcolor=black@0.6:shadowx=2:shadowy=2:` +
+        `alpha='${alphaExpr}'`;
+    }
+
     const drawtextFilter = fontPath
-      ? `drawtext=fontfile='${fontPath}':textfile='${escapedProductPath}':fontcolor=white:fontsize=64:` +
-        `x=(w-text_w)/2:y=h-420:borderw=3:bordercolor=black@0.85:shadowcolor=black@0.6:shadowx=2:shadowy=2:` +
-        `enable='gte(t,2)',` +
-        `drawtext=fontfile='${fontPath}':textfile='${escapedPricePath}':fontcolor=white:fontsize=56:` +
-        `x=(w-text_w)/2:y=h-320:borderw=3:bordercolor=black@0.85:shadowcolor=black@0.6:shadowx=2:shadowy=2:` +
-        `enable='gte(t,5)',` +
-        `drawtext=fontfile='${fontPath}':textfile='${escapedTaglinePath}':fontcolor=white:fontsize=40:` +
-        `x=(w-text_w)/2:y=h-220:borderw=2:bordercolor=black@0.75:shadowcolor=black@0.5:shadowx=2:shadowy=2:` +
-        `enable='gte(t,8)'`
+      ? [
+          animatedTextFilter(escapedProductPath, 64, 420, 2, 0.6, 25),
+          animatedTextFilter(escapedPricePath, 56, 320, 5, 0.6, 25),
+          animatedTextFilter(escapedTaglinePath, 40, 220, 8, 0.6, 20)
+        ].join(',')
       : null;
-    // Helper to append a filter to a filter-chain label only if it exists
     const withOverlay = (baseFilter) => drawtextFilter ? `${baseFilter},${drawtextFilter}` : baseFilter;
 
     let inputArgsBuilder;
 
-    if (mode === '1') {
-      // Mode 1: single photo, real Ken Burns effect — zoom in gradually
-      // while panning left-to-right. Note: an earlier version of this used
-      // zoompan directly on the raw photo resolution and got OOM-killed on
-      // Railway. Two things fix that here: (1) we pre-scale to a moderate
-      // 1620x2880 working size instead of the original (often much larger)
-      // photo resolution before zoompan touches it, and (2) -threads is
-      // pinned to 2 (see FFMPEG_THREADS) so libx264 doesn't over-allocate.
-      // If this still OOMs on the 1GB free-tier container, first thing to
-      // try is lowering the pre-scale size further (e.g. 1215x2160) before
-      // falling back to a crop-only pan.
-      const totalFrames = TARGET_DURATION * 25; // 375 frames at 25fps
+    if (modeStr === '1') {
+      console.log('BRANCH: Mode 1 (Ken Burns zoompan) selected');
+      const totalFrames = TARGET_DURATION * 25;
       inputArgsBuilder = (crf, out) => {
         const args = ['-y', '-loop', '1', '-framerate', '25', '-i', mediaPath];
         if (musicPath) args.push('-i', musicPath);
@@ -199,7 +171,7 @@ app.post('/render', async (req, res) => {
           '-filter_complex',
           `${withOverlay(
             `[0:v]scale=1620:2880:force_original_aspect_ratio=increase,crop=1620:2880,` +
-            `zoompan=z='min(zoom+0.0008,1.2)':` +
+            `zoompan=z='min(zoom+0.0008\\,1.2)':` +
             `x='(iw-iw/zoom)*(on/${totalFrames - 1})':` +
             `y='(ih-ih/zoom)/2':` +
             `d=${totalFrames}:s=1080x1920:fps=25,` +
@@ -215,8 +187,8 @@ app.post('/render', async (req, res) => {
         args.push(...outputArgs, out);
         return args;
       };
-    } else if (mode === '3') {
-      // Mode 3: input video, trim + color grade + overlay + mix music
+    } else if (modeStr === '3') {
+      console.log('BRANCH: Mode 3 (video edit) selected');
       inputArgsBuilder = (crf, out) => {
         const args = ['-y', '-i', mediaPath];
         if (musicPath) args.push('-i', musicPath);
@@ -235,9 +207,7 @@ app.post('/render', async (req, res) => {
         return args;
       };
     } else {
-      // Mode 2 (slideshow) — needs multiple photo URLs (media_url can be a comma-separated
-      // list once the n8n side is upgraded to capture MediaUrl0..MediaUrl4).
-      // Falls back to treating it like Mode 1 with a single photo for now.
+      console.log('BRANCH: Mode 2/fallback (no zoompan) selected — modeStr was:', modeStr);
       inputArgsBuilder = (crf, out) => {
         const args = ['-y', '-loop', '1', '-framerate', '25', '-i', mediaPath];
         if (musicPath) args.push('-i', musicPath);
@@ -268,7 +238,9 @@ app.post('/render', async (req, res) => {
     return res.json({
       finalVideoUrl,
       durationSeconds: TARGET_DURATION,
-      fileSizeMB
+      fileSizeMB,
+      modeUsed: modeStr,
+      serverVersion: 'v2-debug'
     });
   } catch (err) {
     console.error('Render failed:', err.stack || err.message || err);
@@ -277,7 +249,7 @@ app.post('/render', async (req, res) => {
   }
 });
 
-app.get('/health', (req, res) => res.json({ status: 'ok' }));
+app.get('/health', (req, res) => res.json({ status: 'ok', version: 'v2-debug' }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`FFmpeg render server listening on port ${PORT}`));
