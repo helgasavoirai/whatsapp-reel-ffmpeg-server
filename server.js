@@ -45,6 +45,22 @@ function fontForLanguage(language) {
   return null;
 }
 
+// Per the Trello FFmpeg command references, product_name and price use the
+// BOLD weight, tagline stays Regular. Falls back to the regular font (same
+// script) if the bold file hasn't been uploaded to /fonts yet, so overlays
+// never break — they'll just render non-bold until the bold files are added.
+function boldFontForLanguage(language) {
+  const lang = (language || '').toLowerCase();
+  let preferred;
+  if (lang.includes('hindi')) preferred = path.join(FONTS_DIR, 'NotoSansDevanagari-Bold.ttf');
+  else if (lang.includes('gujarati')) preferred = path.join(FONTS_DIR, 'NotoSansGujarati-Bold.ttf');
+  else preferred = path.join(FONTS_DIR, 'NotoSans-Bold.ttf');
+
+  if (fs.existsSync(preferred)) return preferred;
+  console.warn(`Bold font not found at ${preferred}, falling back to Regular weight`);
+  return fontForLanguage(language);
+}
+
 async function downloadFile(url, destPath) {
   const response = await axios.get(url, {
     responseType: 'arraybuffer',
@@ -126,23 +142,36 @@ app.post('/render', async (req, res) => {
     const escapedPricePath = escapePath(priceTextPath);
     const escapedTaglinePath = escapePath(taglineTextPath);
 
-    function animatedTextFilter(textfilePath, fontSize, baseY, appearAt, animDur, slideDist) {
-      const yExpr = `h-${baseY}+${slideDist}*(1-min(max((t-${appearAt})/${animDur}\\,0)\\,1))`;
+    const boldFontPath = boldFontForLanguage(language);
+
+    // One drawtext line, animated (fade + slight slide) into its resting
+    // position starting at appearAt. yFinalExpr is a raw ffmpeg expression
+    // for the resting y (no quotes needed, e.g. '200' or '(h/2)-40').
+    function animatedTextFilter(textfilePath, fontFileToUse, fontColor, fontSize, yFinalExpr, appearAt, animDur, slideDist) {
+      const yExpr = `(${yFinalExpr})+${slideDist}*(1-min(max((t-${appearAt})/${animDur}\\,0)\\,1))`;
       const alphaExpr = `if(lt(t\\,${appearAt})\\,0\\,min((t-${appearAt})/${animDur}\\,1))`;
-      return `drawtext=fontfile='${fontPath}':textfile='${textfilePath}':fontcolor=white:fontsize=${fontSize}:` +
+      return `drawtext=fontfile='${fontFileToUse}':textfile='${textfilePath}':fontcolor=${fontColor}:fontsize=${fontSize}:` +
         `x=(w-text_w)/2:y='${yExpr}':` +
         `borderw=3:bordercolor=black@0.85:shadowcolor=black@0.6:shadowx=2:shadowy=2:` +
         `alpha='${alphaExpr}'`;
     }
 
-    const drawtextFilter = fontPath
-      ? [
-          animatedTextFilter(escapedProductPath, 64, 420, 2, 0.6, 25),
-          animatedTextFilter(escapedPricePath, 56, 320, 5, 0.6, 25),
-          animatedTextFilter(escapedTaglinePath, 40, 220, 8, 0.6, 20)
-        ].join(',')
-      : null;
-    const withOverlay = (baseFilter) => drawtextFilter ? `${baseFilter},${drawtextFilter}` : baseFilter;
+    // Per the Trello FFmpeg command references (Mode 1 & Mode 2 cards):
+    // product name near the top (bold, white), price front-and-center in
+    // the middle (bold, YELLOW, largest), tagline near the bottom
+    // (regular weight, white, smallest). Timing differs per mode per the
+    // architecture card (Step 6A/6B/6C), so this is built fresh for
+    // whichever mode ends up rendering.
+    function buildTextOverlay(nameAppearAt, priceAppearAt, taglineAppearAt) {
+      if (!boldFontPath) return null;
+      return [
+        animatedTextFilter(escapedProductPath, boldFontPath, 'white', 60, '200', nameAppearAt, 0.6, 25),
+        animatedTextFilter(escapedPricePath, boldFontPath, 'yellow', 80, '(h/2)', priceAppearAt, 0.6, 25),
+        animatedTextFilter(escapedTaglinePath, fontPath, 'white', 40, 'h-200', taglineAppearAt, 0.6, 20)
+      ].join(',');
+    }
+
+    const withOverlayUsing = (baseFilter, textOverlay) => textOverlay ? `${baseFilter},${textOverlay}` : baseFilter;
 
     // Music fade in/out (1s each), applied identically across Mode 1, 2, and 3.
     // inputIndex is the ffmpeg input number of the music track for that mode.
@@ -161,13 +190,14 @@ app.post('/render', async (req, res) => {
       inputArgsBuilder = (crf, out) => {
         const args = ['-y', '-loop', '1', '-framerate', '25', '-i', mediaPath];
         if (musicPath) args.push('-i', musicPath);
-        const videoFilter = `${withOverlay(
+        const videoFilter = `${withOverlayUsing(
           `[0:v]scale=1620:2880:force_original_aspect_ratio=increase,crop=1620:2880,` +
           `zoompan=z='min(zoom+0.0008\\,1.2)':` +
           `x='(iw-iw/zoom)*(on/${totalFrames - 1})':` +
           `y='(ih-ih/zoom)/2':` +
           `d=${totalFrames}:s=1080x1920:fps=25,` +
-          `fade=t=in:st=0:d=1`
+          `fade=t=in:st=0:d=1`,
+          buildTextOverlay(2, 5, 8)
         )}[v]`;
         const filterChain = musicPath
           ? `${videoFilter};${audioFadeFilter(1)}`
@@ -188,8 +218,8 @@ app.post('/render', async (req, res) => {
       inputArgsBuilder = (crf, out) => {
         const args = ['-y', '-i', mediaPath];
         if (musicPath) args.push('-i', musicPath);
-        const videoFilter = `${withOverlay(`[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,` +
-          `eq=contrast=1.08:saturation=1.15`)}[v]`;
+        const videoFilter = `${withOverlayUsing(`[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,` +
+          `eq=contrast=1.08:saturation=1.15`, buildTextOverlay(2, 6, 10))}[v]`;
         // Fade only the MUSIC track (not the product's own voice/audio) in
         // and out, then mix it with the video's original audio.
         const filterChain = musicPath
@@ -252,8 +282,9 @@ app.post('/render', async (req, res) => {
           }
         }
 
-        if (drawtextFilter) {
-          filterParts.push(`[${prevLabel}]${drawtextFilter}[v]`);
+        const mode2TextOverlay = buildTextOverlay(0, 5, 10);
+        if (mode2TextOverlay) {
+          filterParts.push(`[${prevLabel}]${mode2TextOverlay}[v]`);
         } else {
           filterParts.push(`[${prevLabel}]null[v]`);
         }
@@ -275,7 +306,7 @@ app.post('/render', async (req, res) => {
       inputArgsBuilder = (crf, out) => {
         const args = ['-y', '-loop', '1', '-framerate', '25', '-i', mediaPath];
         if (musicPath) args.push('-i', musicPath);
-        const videoFilter = `${withOverlay(`[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fade=t=in:st=0:d=1`)}[v]`;
+        const videoFilter = `${withOverlayUsing(`[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fade=t=in:st=0:d=1`, buildTextOverlay(2, 5, 8))}[v]`;
         const filterChain = musicPath ? `${videoFilter};${audioFadeFilter(1)}` : videoFilter;
         args.push('-filter_complex', filterChain, '-map', '[v]');
         const outputArgs = ['-t', String(TARGET_DURATION), '-c:v', 'libx264', '-preset', 'fast', '-crf', String(crf), '-threads', FFMPEG_THREADS, '-pix_fmt', 'yuv420p'];
