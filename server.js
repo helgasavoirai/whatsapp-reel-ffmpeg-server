@@ -181,6 +181,7 @@ app.post('/render', async (req, res) => {
     }
 
     let inputArgsBuilder;
+    let actualOutputDuration = TARGET_DURATION; // Mode 3 overrides this (13s, or shorter if the trader's video is shorter)
 
     if (modeStr === '1') {
       console.log('BRANCH: Mode 1 (Ken Burns zoompan) selected');
@@ -215,18 +216,41 @@ app.post('/render', async (req, res) => {
       console.log('BRANCH: Mode 3 (video edit) selected');
       const mediaPath = path.join(workDir, 'media_input');
       await downloadFile(media_url, mediaPath);
+
+      // Trello spec: output is 13s, but if the trader's video is SHORTER
+      // than 13s, use its actual length instead of forcing -t 13 (which
+      // would just leave it at its natural shorter length anyway, but this
+      // makes the reported duration accurate and keeps text/audio timing
+      // sane for very short clips).
+      const MODE3_MAX_DURATION = 13;
+      let mode3Duration = MODE3_MAX_DURATION;
+      try {
+        const probedDuration = await new Promise((resolve, reject) => {
+          execFile('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', mediaPath], (err, stdout) => {
+            if (err) return reject(err);
+            const d = parseFloat(stdout);
+            resolve(isNaN(d) ? null : d);
+          });
+        });
+        if (probedDuration && probedDuration < MODE3_MAX_DURATION) mode3Duration = probedDuration;
+      } catch (e) {
+        console.warn('ffprobe duration check failed, defaulting to 13s cap:', e.message);
+      }
+      actualOutputDuration = mode3Duration;
+
       inputArgsBuilder = (crf, out) => {
         const args = ['-y', '-i', mediaPath];
         if (musicPath) args.push('-i', musicPath);
+        // Per Trello spec: saturation 1.3, contrast 1.1, brightness 0.05
         const videoFilter = `${withOverlayUsing(`[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,` +
-          `eq=contrast=1.08:saturation=1.15`, buildTextOverlay(2, 6, 10))}[v]`;
-        // Fade only the MUSIC track (not the product's own voice/audio) in
-        // and out, then mix it with the video's original audio.
+          `eq=saturation=1.3:contrast=1.1:brightness=0.05`, buildTextOverlay(2, 6, 10))}[v]`;
+        // Per Trello spec: original video audio at 30% volume, music at 70%,
+        // with the music fading in/out (fade only applies to the music).
         const filterChain = musicPath
-          ? `${videoFilter};[1:a]afade=t=in:st=0:d=1,afade=t=out:st=${Math.max(TARGET_DURATION - 1, 0)}:d=1[music_faded];[0:a][music_faded]amix=inputs=2:duration=first:dropout_transition=2[a]`
+          ? `${videoFilter};[0:a]volume=0.3[a0];[1:a]volume=0.7,afade=t=in:st=0:d=1,afade=t=out:st=${Math.max(mode3Duration - 1, 0)}:d=1[a1];[a0][a1]amix=inputs=2:duration=first:dropout_transition=2[a]`
           : videoFilter;
         args.push('-filter_complex', filterChain, '-map', '[v]');
-        const outputArgs = ['-t', String(TARGET_DURATION), '-c:v', 'libx264', '-preset', 'fast', '-crf', String(crf), '-threads', FFMPEG_THREADS, '-pix_fmt', 'yuv420p'];
+        const outputArgs = ['-t', String(mode3Duration), '-c:v', 'libx264', '-preset', 'fast', '-crf', String(crf), '-threads', FFMPEG_THREADS, '-pix_fmt', 'yuv420p'];
         if (musicPath) {
           args.push('-map', '[a]');
           outputArgs.push('-c:a', 'aac', '-b:a', '128k');
@@ -330,7 +354,7 @@ app.post('/render', async (req, res) => {
 
     return res.json({
       finalVideoUrl,
-      durationSeconds: TARGET_DURATION,
+      durationSeconds: actualOutputDuration,
       fileSizeMB,
       modeUsed: modeStr,
       serverVersion: 'v3-mode2-slideshow'
