@@ -56,16 +56,6 @@ async function downloadFile(url, destPath) {
   return destPath;
 }
 
-function escapeDrawtext(text) {
-  return String(text || '')
-    .replace(/\\/g, '\\\\')
-    .replace(/:/g, '\\:')
-    .replace(/'/g, "\\'")
-    .replace(/,/g, '\\,')
-    .replace(/\[/g, '\\[')
-    .replace(/\]/g, '\\]');
-}
-
 function escapePath(p) {
   return String(p).replace(/\\/g, '\\\\').replace(/'/g, "'\\\\''");
 }
@@ -78,7 +68,7 @@ function getFileSizeMB(filePath) {
 function encodeWithCrf(inputArgsBuilder, outputPath, crf) {
   return new Promise((resolve, reject) => {
     const args = inputArgsBuilder(crf, outputPath);
-    console.log('FFMPEG ARGS:', JSON.stringify(args)); // debug: shows in Railway Deploy Logs
+    console.log('FFMPEG ARGS:', JSON.stringify(args));
     execFile('ffmpeg', args, { maxBuffer: 1024 * 1024 * 50 }, (err, stdout, stderr) => {
       if (err) return reject(new Error(stderr || err.message));
       resolve(outputPath);
@@ -113,17 +103,12 @@ app.post('/render', async (req, res) => {
 
   try {
     const { mode, media_url, audio_url, music, product_name, price, tagline, language } = req.body;
-    // mode can arrive as the STRING "1" or the NUMBER 1 (Google Sheets
-    // auto-converts numeric-looking cells) — always normalize before branching.
     const modeStr = String(mode);
     console.log('RENDER REQUEST mode(raw)=', JSON.stringify(mode), 'modeStr=', modeStr);
 
     if (!mode || !media_url) {
       return res.status(400).json({ error: 'mode and media_url are required' });
     }
-
-    const mediaPath = path.join(workDir, 'media_input');
-    await downloadFile(media_url, mediaPath);
 
     const musicPath = music && fs.existsSync(path.join(MUSIC_DIR, music))
       ? path.join(MUSIC_DIR, music) : null;
@@ -163,6 +148,8 @@ app.post('/render', async (req, res) => {
 
     if (modeStr === '1') {
       console.log('BRANCH: Mode 1 (Ken Burns zoompan) selected');
+      const mediaPath = path.join(workDir, 'media_input');
+      await downloadFile(media_url, mediaPath);
       const totalFrames = TARGET_DURATION * 25;
       inputArgsBuilder = (crf, out) => {
         const args = ['-y', '-loop', '1', '-framerate', '25', '-i', mediaPath];
@@ -189,6 +176,8 @@ app.post('/render', async (req, res) => {
       };
     } else if (modeStr === '3') {
       console.log('BRANCH: Mode 3 (video edit) selected');
+      const mediaPath = path.join(workDir, 'media_input');
+      await downloadFile(media_url, mediaPath);
       inputArgsBuilder = (crf, out) => {
         const args = ['-y', '-i', mediaPath];
         if (musicPath) args.push('-i', musicPath);
@@ -206,8 +195,66 @@ app.post('/render', async (req, res) => {
         args.push(...outputArgs, out);
         return args;
       };
+    } else if (modeStr === '2') {
+      console.log('BRANCH: Mode 2 (slideshow) selected');
+      // media_url is a comma-separated list of 3-5 photo URLs (built by the
+      // n8n Auto Detection node from Twilio's MediaUrl0..MediaUrl4).
+      const photoUrls = String(media_url).split(',').map(u => u.trim()).filter(Boolean);
+      const n = Math.max(photoUrls.length, 1);
+      console.log(`Mode 2: ${n} photos received`);
+
+      const xfadeDur = 0.5; // per Trello spec: 0.5s cross-fade
+      const holdDur = n > 1 ? (TARGET_DURATION - xfadeDur * (n - 1)) / n : TARGET_DURATION;
+      const clipDur = n > 1 ? holdDur + xfadeDur : TARGET_DURATION;
+
+      const photoPaths = [];
+      for (let i = 0; i < n; i++) {
+        const p = path.join(workDir, `photo_${i}.jpg`);
+        await downloadFile(photoUrls[i], p);
+        photoPaths.push(p);
+      }
+
+      inputArgsBuilder = (crf, out) => {
+        const args = ['-y'];
+        for (const p of photoPaths) {
+          args.push('-loop', '1', '-t', String(clipDur), '-i', p);
+        }
+        if (musicPath) args.push('-i', musicPath);
+
+        const filterParts = [];
+        for (let i = 0; i < n; i++) {
+          filterParts.push(`[${i}:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1[v${i}]`);
+        }
+
+        let prevLabel = 'v0';
+        if (n > 1) {
+          for (let i = 1; i < n; i++) {
+            const offset = i * holdDur;
+            const outLabel = `vx${i}`;
+            filterParts.push(`[${prevLabel}][v${i}]xfade=transition=fade:duration=${xfadeDur}:offset=${offset.toFixed(3)}[${outLabel}]`);
+            prevLabel = outLabel;
+          }
+        }
+
+        if (drawtextFilter) {
+          filterParts.push(`[${prevLabel}]${drawtextFilter}[v]`);
+        } else {
+          filterParts.push(`[${prevLabel}]null[v]`);
+        }
+
+        args.push('-filter_complex', filterParts.join(';'), '-map', '[v]');
+        const outputArgs = ['-t', String(TARGET_DURATION), '-c:v', 'libx264', '-preset', 'fast', '-crf', String(crf), '-threads', FFMPEG_THREADS, '-pix_fmt', 'yuv420p'];
+        if (musicPath) {
+          args.push('-map', `${n}:a`, '-shortest');
+          outputArgs.push('-c:a', 'aac', '-b:a', '128k');
+        }
+        args.push(...outputArgs, out);
+        return args;
+      };
     } else {
-      console.log('BRANCH: Mode 2/fallback (no zoompan) selected — modeStr was:', modeStr);
+      console.log('BRANCH: unrecognized mode, using single-photo fallback — modeStr was:', modeStr);
+      const mediaPath = path.join(workDir, 'media_input');
+      await downloadFile(media_url, mediaPath);
       inputArgsBuilder = (crf, out) => {
         const args = ['-y', '-loop', '1', '-framerate', '25', '-i', mediaPath];
         if (musicPath) args.push('-i', musicPath);
@@ -240,7 +287,7 @@ app.post('/render', async (req, res) => {
       durationSeconds: TARGET_DURATION,
       fileSizeMB,
       modeUsed: modeStr,
-      serverVersion: 'v2-debug'
+      serverVersion: 'v3-mode2-slideshow'
     });
   } catch (err) {
     console.error('Render failed:', err.stack || err.message || err);
@@ -249,7 +296,7 @@ app.post('/render', async (req, res) => {
   }
 });
 
-app.get('/health', (req, res) => res.json({ status: 'ok', version: 'v2-debug' }));
+app.get('/health', (req, res) => res.json({ status: 'ok', version: 'v3-mode2-slideshow' }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`FFmpeg render server listening on port ${PORT}`));
