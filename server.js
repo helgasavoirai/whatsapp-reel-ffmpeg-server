@@ -129,7 +129,7 @@ app.post('/render', async (req, res) => {
   fs.mkdirSync(workDir, { recursive: true });
 
   try {
-    const { mode, media_url, audio_url, music, product_name, tagline, language } = req.body;
+    const { mode, media_url, audio_url, music, product_name, price, tagline, language } = req.body;
 
     if (!mode || !media_url) {
       return res.status(400).json({ error: 'mode and media_url are required' });
@@ -150,18 +150,30 @@ app.post('/render', async (req, res) => {
     // read verbatim — only the file PATH needs escaping, and we control that
     // path so it never contains special characters.
     const productTextPath = path.join(workDir, 'product_name.txt');
+    const priceTextPath = path.join(workDir, 'price.txt');
     const taglineTextPath = path.join(workDir, 'tagline.txt');
     fs.writeFileSync(productTextPath, String(product_name || ''));
+    fs.writeFileSync(priceTextPath, String(price || ''));
     fs.writeFileSync(taglineTextPath, String(tagline || ''));
     const escapedProductPath = escapePath(productTextPath);
+    const escapedPricePath = escapePath(priceTextPath);
     const escapedTaglinePath = escapePath(taglineTextPath);
 
     // If no font is available yet, skip the overlay instead of failing the render.
+    // No boxcolor/box=1 anymore — border + shadow keep text readable without
+    // the flat grey rectangle. enable='gte(t,N)' makes each line appear at
+    // its own timestamp per the Trello timing spec (name 2s, price 5s,
+    // tagline 8s) and then stay visible until the end.
     const drawtextFilter = fontPath
       ? `drawtext=fontfile='${fontPath}':textfile='${escapedProductPath}':fontcolor=white:fontsize=64:` +
-        `x=(w-text_w)/2:y=h-320:box=1:boxcolor=black@0.5:boxborderw=20,` +
+        `x=(w-text_w)/2:y=h-420:borderw=3:bordercolor=black@0.85:shadowcolor=black@0.6:shadowx=2:shadowy=2:` +
+        `enable='gte(t,2)',` +
+        `drawtext=fontfile='${fontPath}':textfile='${escapedPricePath}':fontcolor=white:fontsize=56:` +
+        `x=(w-text_w)/2:y=h-320:borderw=3:bordercolor=black@0.85:shadowcolor=black@0.6:shadowx=2:shadowy=2:` +
+        `enable='gte(t,5)',` +
         `drawtext=fontfile='${fontPath}':textfile='${escapedTaglinePath}':fontcolor=white:fontsize=40:` +
-        `x=(w-text_w)/2:y=h-220:box=1:boxcolor=black@0.4:boxborderw=16`
+        `x=(w-text_w)/2:y=h-220:borderw=2:bordercolor=black@0.75:shadowcolor=black@0.5:shadowx=2:shadowy=2:` +
+        `enable='gte(t,8)'`
       : null;
     // Helper to append a filter to a filter-chain label only if it exists
     const withOverlay = (baseFilter) => drawtextFilter ? `${baseFilter},${drawtextFilter}` : baseFilter;
@@ -169,19 +181,28 @@ app.post('/render', async (req, res) => {
     let inputArgsBuilder;
 
     if (mode === '1') {
-      // Mode 1: single photo, slow Ken-Burns-style pan (lightweight version).
-      // Full `zoompan` re-samples the whole frame every output frame and
-      // OOM-killed the Railway container. A `crop` with a time-varying
-      // offset is far cheaper — it just shifts which pixels are read, no
-      // per-frame rescaling — so it gives a similar "alive" feel safely.
+      // Mode 1: single photo, real Ken Burns effect — zoom in gradually
+      // while panning left-to-right. Note: an earlier version of this used
+      // zoompan directly on the raw photo resolution and got OOM-killed on
+      // Railway. Two things fix that here: (1) we pre-scale to a moderate
+      // 1620x2880 working size instead of the original (often much larger)
+      // photo resolution before zoompan touches it, and (2) -threads is
+      // pinned to 2 (see FFMPEG_THREADS) so libx264 doesn't over-allocate.
+      // If this still OOMs on the 1GB free-tier container, first thing to
+      // try is lowering the pre-scale size further (e.g. 1215x2160) before
+      // falling back to a crop-only pan.
+      const totalFrames = TARGET_DURATION * 25; // 375 frames at 25fps
       inputArgsBuilder = (crf, out) => {
         const args = ['-y', '-loop', '1', '-framerate', '25', '-i', mediaPath];
         if (musicPath) args.push('-i', musicPath);
         args.push(
           '-filter_complex',
           `${withOverlay(
-            `[0:v]scale=1350:2400:force_original_aspect_ratio=increase,crop=1350:2400,` +
-            `crop=1080:1920:x='(in_w-1080)*min(t/${TARGET_DURATION},1)':y='(in_h-1920)/2',` +
+            `[0:v]scale=1620:2880:force_original_aspect_ratio=increase,crop=1620:2880,` +
+            `zoompan=z='min(zoom+0.0008,1.2)':` +
+            `x='(iw-iw/zoom)*(on/${totalFrames - 1})':` +
+            `y='(ih-ih/zoom)/2':` +
+            `d=${totalFrames}:s=1080x1920:fps=25,` +
             `fade=t=in:st=0:d=1`
           )}[v]`,
           '-map', '[v]'
