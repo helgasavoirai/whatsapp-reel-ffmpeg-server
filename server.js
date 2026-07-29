@@ -238,17 +238,39 @@ app.post('/render', async (req, res) => {
       }
       actualOutputDuration = mode3Duration;
 
+      // WhatsApp/Twilio videos are sometimes silent (no audio track at all -
+      // this is a known WhatsApp quirk, not just an edge case). Referencing
+      // [0:a] in the filter_complex when there's no audio stream 0 crashes
+      // ffmpeg outright, so probe for an audio stream first and fall back
+      // to music-only (same treatment as Mode 1/2) when the video is silent.
+      let videoHasAudio = false;
+      try {
+        const audioProbe = await new Promise((resolve, reject) => {
+          execFile('ffprobe', ['-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=index', '-of', 'csv=p=0', mediaPath], (err, stdout) => {
+            if (err) return reject(err);
+            resolve(stdout.trim());
+          });
+        });
+        videoHasAudio = audioProbe.length > 0;
+      } catch (e) {
+        console.warn('ffprobe audio-stream check failed, assuming no audio track:', e.message);
+      }
+      console.log('Mode 3: video has audio track =', videoHasAudio);
+
       inputArgsBuilder = (crf, out) => {
         const args = ['-y', '-i', mediaPath];
         if (musicPath) args.push('-i', musicPath);
         // Per Trello spec: saturation 1.3, contrast 1.1, brightness 0.05
         const videoFilter = `${withOverlayUsing(`[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,` +
           `eq=saturation=1.3:contrast=1.1:brightness=0.05`, buildTextOverlay(2, 6, 10))}[v]`;
-        // Per Trello spec: original video audio at 30% volume, music at 70%,
-        // with the music fading in/out (fade only applies to the music).
-        const filterChain = musicPath
-          ? `${videoFilter};[0:a]volume=0.3[a0];[1:a]volume=0.7,afade=t=in:st=0:d=1,afade=t=out:st=${Math.max(mode3Duration - 1, 0)}:d=1[a1];[a0][a1]amix=inputs=2:duration=first:dropout_transition=2[a]`
-          : videoFilter;
+        let filterChain = videoFilter;
+        if (musicPath && videoHasAudio) {
+          // Per Trello spec: original video audio at 30% volume, music at 70%.
+          filterChain = `${videoFilter};[0:a]volume=0.3[a0];[1:a]volume=0.7,afade=t=in:st=0:d=1,afade=t=out:st=${Math.max(mode3Duration - 1, 0)}:d=1[a1];[a0][a1]amix=inputs=2:duration=first:dropout_transition=2[a]`;
+        } else if (musicPath && !videoHasAudio) {
+          // Silent video: just use the music track (faded), nothing to mix.
+          filterChain = `${videoFilter};${audioFadeFilter(1)}`;
+        }
         args.push('-filter_complex', filterChain, '-map', '[v]');
         const outputArgs = ['-t', String(mode3Duration), '-c:v', 'libx264', '-preset', 'fast', '-crf', String(crf), '-threads', FFMPEG_THREADS, '-pix_fmt', 'yuv420p'];
         if (musicPath) {
