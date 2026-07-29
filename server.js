@@ -81,6 +81,59 @@ function getFileSizeMB(filePath) {
   return +(stats.size / (1024 * 1024)).toFixed(2);
 }
 
+// ---------------------------------------------------------------------
+// Text wrapping for drawtext overlays.
+//
+// ffmpeg's drawtext filter does NOT word-wrap on its own — a textfile is
+// rendered as literally as many lines as it contains. x=(w-text_w)/2 only
+// centers the (single, full-width) line; if that line is wider than the
+// frame, the math still "centers" it but half of it falls off each side.
+// That's exactly why long taglines were getting cut off left/right.
+//
+// Fix: measure (approximately) how many characters fit per line for a
+// given font size and target width, wrap onto multiple lines, and shrink
+// the font size a step at a time if it still doesn't fit within a max
+// number of lines. This is an estimate (no real glyph metrics available
+// server-side without adding a font-measuring lib), but a conservative
+// average-char-width ratio keeps text safely inside the frame in practice.
+// ---------------------------------------------------------------------
+const AVG_CHAR_WIDTH_RATIO = 0.55;
+
+function wrapTextToWidth(text, fontSize, maxWidthPx) {
+  const words = String(text).split(/\s+/).filter(Boolean);
+  if (words.length === 0) return '';
+  const avgCharWidth = fontSize * AVG_CHAR_WIDTH_RATIO;
+  const maxCharsPerLine = Math.max(1, Math.floor(maxWidthPx / avgCharWidth));
+
+  const lines = [];
+  let current = '';
+  for (const word of words) {
+    const candidate = current ? `${current} ${word}` : word;
+    if (candidate.length > maxCharsPerLine && current) {
+      lines.push(current);
+      current = word;
+    } else {
+      current = candidate;
+    }
+  }
+  if (current) lines.push(current);
+  return lines.join('\n');
+}
+
+// If wrapping still produces more lines than maxLines (font too big for
+// the text length / frame width), shrink fontSize step by step until it
+// fits, down to minFontSize. Keeps very long taglines from either running
+// off-screen OR growing into a huge unreadable block of text.
+function fitTextBlock(text, initialFontSize, maxWidthPx, maxLines, minFontSize = 24) {
+  let fontSize = initialFontSize;
+  let wrapped = wrapTextToWidth(text, fontSize, maxWidthPx);
+  while (wrapped.split('\n').length > maxLines && fontSize > minFontSize) {
+    fontSize -= 4;
+    wrapped = wrapTextToWidth(text, fontSize, maxWidthPx);
+  }
+  return { text: wrapped, fontSize };
+}
+
 function encodeWithCrf(inputArgsBuilder, outputPath, crf) {
   return new Promise((resolve, reject) => {
     const args = inputArgsBuilder(crf, outputPath);
@@ -137,6 +190,10 @@ app.post('/render', async (req, res) => {
     const taglineTextPath = path.join(workDir, 'tagline.txt');
     fs.writeFileSync(productTextPath, String(product_name || ''));
     fs.writeFileSync(priceTextPath, String(price || ''));
+    // NOTE: tagline.txt is intentionally NOT written with the raw tagline
+    // here anymore — buildTextOverlay() below rewraps it per-mode (each
+    // mode has a different frame width) and overwrites this file right
+    // before it's referenced by the drawtext filter.
     fs.writeFileSync(taglineTextPath, String(tagline || ''));
     const escapedProductPath = escapePath(productTextPath);
     const escapedPricePath = escapePath(priceTextPath);
@@ -151,7 +208,7 @@ app.post('/render', async (req, res) => {
       const yExpr = `(${yFinalExpr})+${slideDist}*(1-min(max((t-${appearAt})/${animDur}\\,0)\\,1))`;
       const alphaExpr = `if(lt(t\\,${appearAt})\\,0\\,min((t-${appearAt})/${animDur}\\,1))`;
       return `drawtext=fontfile='${fontFileToUse}':textfile='${textfilePath}':fontcolor=${fontColor}:fontsize=${fontSize}:` +
-        `x=(w-text_w)/2:y='${yExpr}':` +
+        `x=(w-text_w)/2:y='${yExpr}':text_align=center:line_spacing=6:` +
         `borderw=3:bordercolor=black@0.85:shadowcolor=black@0.6:shadowx=2:shadowy=2:` +
         `alpha='${alphaExpr}'`;
     }
@@ -162,12 +219,32 @@ app.post('/render', async (req, res) => {
     // (regular weight, white, smallest). Timing differs per mode per the
     // architecture card (Step 6A/6B/6C), so this is built fresh for
     // whichever mode ends up rendering.
-    function buildTextOverlay(nameAppearAt, priceAppearAt, taglineAppearAt) {
+    //
+    // videoWidth is required now so the tagline can be wrapped/sized
+    // against the ACTUAL output frame width (1620 for Mode 1, 1080 for
+    // Mode 2/3/fallback) instead of overflowing it.
+    function buildTextOverlay(nameAppearAt, priceAppearAt, taglineAppearAt, videoWidth) {
       if (!boldFontPath) return null;
+
+      const TAGLINE_BASE_FONT_SIZE = 40;
+      const TAGLINE_MAX_LINES = 3;
+      const TAGLINE_BOTTOM_MARGIN = 160; // px from bottom edge to the bottom line of text
+      const safeWidthPx = videoWidth * 0.85; // ~7.5% margin on each side
+
+      const fitted = fitTextBlock(String(tagline || ''), TAGLINE_BASE_FONT_SIZE, safeWidthPx, TAGLINE_MAX_LINES);
+      fs.writeFileSync(taglineTextPath, fitted.text);
+
+      const lineCount = fitted.text.split('\n').length;
+      const lineHeight = fitted.fontSize * 1.3;
+      // Anchor moves UP as the tagline wraps onto more lines, so the
+      // bottom-most line always sits ~TAGLINE_BOTTOM_MARGIN px from the
+      // bottom edge instead of the whole block sinking off-screen.
+      const taglineY = `h-${TAGLINE_BOTTOM_MARGIN}-${(lineCount - 1) * lineHeight}`;
+
       return [
         animatedTextFilter(escapedProductPath, boldFontPath, 'white', 60, '200', nameAppearAt, 0.6, 25),
         animatedTextFilter(escapedPricePath, boldFontPath, 'yellow', 80, '(h/2)', priceAppearAt, 0.6, 25),
-        animatedTextFilter(escapedTaglinePath, fontPath, 'white', 40, 'h-200', taglineAppearAt, 0.6, 20)
+        animatedTextFilter(escapedTaglinePath, fontPath, 'white', fitted.fontSize, taglineY, taglineAppearAt, 0.6, 20)
       ].join(',');
     }
 
@@ -198,7 +275,7 @@ app.post('/render', async (req, res) => {
           `y='(ih-ih/zoom)/2':` +
           `d=${totalFrames}:s=1080x1920:fps=25,` +
           `fade=t=in:st=0:d=1`,
-          buildTextOverlay(2, 5, 8)
+          buildTextOverlay(2, 5, 8, 1620)
         )}[v]`;
         const filterChain = musicPath
           ? `${videoFilter};${audioFadeFilter(1)}`
@@ -262,7 +339,7 @@ app.post('/render', async (req, res) => {
         if (musicPath) args.push('-i', musicPath);
         // Per Trello spec: saturation 1.3, contrast 1.1, brightness 0.05
         const videoFilter = `${withOverlayUsing(`[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,` +
-          `eq=saturation=1.3:contrast=1.1:brightness=0.05`, buildTextOverlay(2, 6, 10))}[v]`;
+          `eq=saturation=1.3:contrast=1.1:brightness=0.05`, buildTextOverlay(2, 6, 10, 1080))}[v]`;
         let filterChain = videoFilter;
         if (musicPath && videoHasAudio) {
           // Per Trello spec: original video audio at 30% volume, music at 70%.
@@ -328,7 +405,7 @@ app.post('/render', async (req, res) => {
           }
         }
 
-        const mode2TextOverlay = buildTextOverlay(0, 5, 10);
+        const mode2TextOverlay = buildTextOverlay(0, 5, 10, 1080);
         if (mode2TextOverlay) {
           filterParts.push(`[${prevLabel}]${mode2TextOverlay}[v]`);
         } else {
@@ -352,7 +429,7 @@ app.post('/render', async (req, res) => {
       inputArgsBuilder = (crf, out) => {
         const args = ['-y', '-loop', '1', '-framerate', '25', '-i', mediaPath];
         if (musicPath) args.push('-i', musicPath);
-        const videoFilter = `${withOverlayUsing(`[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fade=t=in:st=0:d=1`, buildTextOverlay(2, 5, 8))}[v]`;
+        const videoFilter = `${withOverlayUsing(`[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fade=t=in:st=0:d=1`, buildTextOverlay(2, 5, 8, 1080))}[v]`;
         const filterChain = musicPath ? `${videoFilter};${audioFadeFilter(1)}` : videoFilter;
         args.push('-filter_complex', filterChain, '-map', '[v]');
         const outputArgs = ['-t', String(TARGET_DURATION), '-c:v', 'libx264', '-preset', 'fast', '-crf', String(crf), '-threads', FFMPEG_THREADS, '-pix_fmt', 'yuv420p'];
@@ -379,7 +456,7 @@ app.post('/render', async (req, res) => {
       durationSeconds: actualOutputDuration,
       fileSizeMB,
       modeUsed: modeStr,
-      serverVersion: 'v3-mode2-slideshow'
+      serverVersion: 'v4-tagline-wrap-fix'
     });
   } catch (err) {
     console.error('Render failed:', err.stack || err.message || err);
@@ -388,7 +465,7 @@ app.post('/render', async (req, res) => {
   }
 });
 
-app.get('/health', (req, res) => res.json({ status: 'ok', version: 'v3-mode2-slideshow' }));
+app.get('/health', (req, res) => res.json({ status: 'ok', version: 'v4-tagline-wrap-fix' }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`FFmpeg render server listening on port ${PORT}`));
