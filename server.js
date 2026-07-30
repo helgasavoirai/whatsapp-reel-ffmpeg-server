@@ -135,9 +135,39 @@ app.post('/render', async (req, res) => {
     const productTextPath = path.join(workDir, 'product_name.txt');
     const priceTextPath = path.join(workDir, 'price.txt');
     const taglineTextPath = path.join(workDir, 'tagline.txt');
-    fs.writeFileSync(productTextPath, String(product_name || ''));
-    fs.writeFileSync(priceTextPath, String(price || ''));
-    fs.writeFileSync(taglineTextPath, String(tagline || ''));
+
+    // Wrap long text onto a second line instead of letting it run off the
+    // left/right edges of the 1080px-wide frame. FFmpeg's drawtext has no
+    // built-in auto-wrap, so this breaks at the best word boundary before
+    // maxCharsPerLine is exceeded. maxCharsPerLine is a rough estimate
+    // (character width ~0.65x fontSize for these fonts, with margin) --
+    // conservative on purpose since Devanagari/Gujarati glyphs tend to be
+    // wider than Latin ones at the same font size. Caps at 2 lines total
+    // (anything beyond that gets merged onto line 2) since 3+ lines would
+    // start colliding with the other overlay elements.
+    function wrapText(text, maxCharsPerLine) {
+      const words = String(text || '').split(' ').filter(Boolean);
+      const lines = [];
+      let current = '';
+      for (const word of words) {
+        const candidate = current ? `${current} ${word}` : word;
+        if (candidate.length > maxCharsPerLine && current) {
+          lines.push(current);
+          current = word;
+        } else {
+          current = candidate;
+        }
+      }
+      if (current) lines.push(current);
+      if (lines.length > 2) {
+        return [lines[0], lines.slice(1).join(' ')].join('\n');
+      }
+      return lines.join('\n');
+    }
+
+    fs.writeFileSync(productTextPath, wrapText(product_name, 24));   // fontsize 60
+    fs.writeFileSync(priceTextPath, wrapText(price, 18));            // fontsize 80
+    fs.writeFileSync(taglineTextPath, wrapText(tagline, 34));        // fontsize 46
     const escapedProductPath = escapePath(productTextPath);
     const escapedPricePath = escapePath(priceTextPath);
     const escapedTaglinePath = escapePath(taglineTextPath);
@@ -147,6 +177,10 @@ app.post('/render', async (req, res) => {
     // One drawtext line, animated (fade + slight slide) into its resting
     // position starting at appearAt. yFinalExpr is a raw ffmpeg expression
     // for the resting y (no quotes needed, e.g. '200' or '(h/2)-40').
+    // x=(w-text_w)/2 centers EACH line independently when the textfile
+    // contains a literal newline (ffmpeg recalculates text_w per line for
+    // multi-line drawtext), so wrapped 2-line text stays centered exactly
+    // like single-line text.
     function animatedTextFilter(textfilePath, fontFileToUse, fontColor, fontSize, yFinalExpr, appearAt, animDur, slideDist) {
       const yExpr = `(${yFinalExpr})+${slideDist}*(1-min(max((t-${appearAt})/${animDur}\\,0)\\,1))`;
       const alphaExpr = `if(lt(t\\,${appearAt})\\,0\\,min((t-${appearAt})/${animDur}\\,1))`;
@@ -159,15 +193,16 @@ app.post('/render', async (req, res) => {
     // Per the Trello FFmpeg command references (Mode 1 & Mode 2 cards):
     // product name near the top (bold, white), price front-and-center in
     // the middle (bold, YELLOW, largest), tagline near the bottom
-    // (regular weight, white, smallest). Timing differs per mode per the
+    // (regular weight, white). Timing differs per mode per the
     // architecture card (Step 6A/6B/6C), so this is built fresh for
-    // whichever mode ends up rendering.
+    // whichever mode ends up rendering. Tagline fontsize bumped 40->46
+    // per feedback that it read too small next to the name/price.
     function buildTextOverlay(nameAppearAt, priceAppearAt, taglineAppearAt) {
       if (!boldFontPath) return null;
       return [
         animatedTextFilter(escapedProductPath, boldFontPath, 'white', 60, '200', nameAppearAt, 0.6, 25),
         animatedTextFilter(escapedPricePath, boldFontPath, 'yellow', 80, '(h/2)', priceAppearAt, 0.6, 25),
-        animatedTextFilter(escapedTaglinePath, fontPath, 'white', 40, 'h-200', taglineAppearAt, 0.6, 20)
+        animatedTextFilter(escapedTaglinePath, fontPath, 'white', 46, 'h-200', taglineAppearAt, 0.6, 20)
       ].join(',');
     }
 
@@ -262,7 +297,11 @@ app.post('/render', async (req, res) => {
         if (musicPath) args.push('-i', musicPath);
         // Per Trello spec: saturation 1.3, contrast 1.1, brightness 0.05
         const videoFilter = `${withOverlayUsing(`[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,` +
-          `eq=saturation=1.3:contrast=1.1:brightness=0.05`, buildTextOverlay(2, 6, 10))}[v]`;
+          `eq=saturation=1.3:contrast=1.1:brightness=0.05`, buildTextOverlay(
+            +(2 * mode3Duration / MODE3_MAX_DURATION).toFixed(2),
+            +(6 * mode3Duration / MODE3_MAX_DURATION).toFixed(2),
+            +(10 * mode3Duration / MODE3_MAX_DURATION).toFixed(2)
+          ))}[v]`;
         let filterChain = videoFilter;
         if (musicPath && videoHasAudio) {
           // Per Trello spec: original video audio at 30% volume, music at 70%.
