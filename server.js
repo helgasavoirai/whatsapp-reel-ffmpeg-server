@@ -22,19 +22,61 @@ const TARGET_DURATION = 15;
 const FFMPEG_THREADS = '2';
 
 // Output frame is 1080px wide (see scale=1080:1920 / 1620:2880->crop below).
-// SAFE_WIDTH_RATIO reserves a margin on each side so text never touches the
-// video edges -- 0.86 means the usable text width is 86% of the frame,
-// i.e. ~7% margin left AND right.
 const FRAME_WIDTH = 1080;
-const SAFE_WIDTH_RATIO = 0.86;
-// Approx average glyph width as a fraction of fontSize for the Noto fonts
-// used here. Kept conservative (wider than a typical Latin estimate)
-// because Devanagari/Gujarati glyphs tend to render wider than Latin ones
-// at the same font size.
-const CHAR_WIDTH_RATIO = 0.62;
 
-function maxCharsForFontSize(fontSize) {
-  return Math.max(4, Math.floor((FRAME_WIDTH * SAFE_WIDTH_RATIO) / (fontSize * CHAR_WIDTH_RATIO)));
+// Base font sizes (px) before any per-language scaling is applied.
+const BASE_FONTSIZE = { product: 60, price: 80, tagline: 46 };
+
+// Per-language tuning. Different scripts need different treatment:
+//  - charWidthRatio: average glyph width as a fraction of fontSize. Latin
+//    glyphs are narrower on average; Devanagari/Gujarati run wider because
+//    of conjuncts and matras, so they get a higher ratio (this makes
+//    wrapText break lines EARLIER for these scripts, avoiding the
+//    edge-hugging long second line we saw before).
+//  - safeWidthRatio: how much of FRAME_WIDTH is usable for text (the rest
+//    is margin, split evenly left/right). Devanagari/Gujarati get a bit
+//    more margin since their glyphs read as visually "heavier".
+//  - lineHeightMultiplier: vertical spacing between wrapped lines, as a
+//    multiple of fontSize. Devanagari/Gujarati matras extend above and
+//    below the baseline more than Latin, so they need more breathing room
+//    or stacked lines look cramped/overlapping.
+//  - fontSizeScale: per-element multiplier on BASE_FONTSIZE. English
+//    taglines tend to run longer (more words for the same meaning), so
+//    tagline is scaled down slightly to keep 2-line wraps compact and
+//    readable rather than dominating the lower third of the frame.
+const LANGUAGE_TEXT_STYLE = {
+  english: {
+    charWidthRatio: 0.55,
+    safeWidthRatio: 0.86,
+    lineHeightMultiplier: 1.15,
+    fontSizeScale: { product: 1.0, price: 1.0, tagline: 0.9 }
+  },
+  hindi: {
+    charWidthRatio: 0.68,
+    safeWidthRatio: 0.82,
+    lineHeightMultiplier: 1.3,
+    fontSizeScale: { product: 0.95, price: 1.0, tagline: 1.0 }
+  },
+  gujarati: {
+    charWidthRatio: 0.68,
+    safeWidthRatio: 0.82,
+    lineHeightMultiplier: 1.3,
+    fontSizeScale: { product: 0.95, price: 1.0, tagline: 1.0 }
+  },
+  default: {
+    charWidthRatio: 0.6,
+    safeWidthRatio: 0.84,
+    lineHeightMultiplier: 1.2,
+    fontSizeScale: { product: 1.0, price: 1.0, tagline: 1.0 }
+  }
+};
+
+function getLanguageStyle(language) {
+  const lang = (language || '').toLowerCase();
+  if (lang.includes('hindi')) return LANGUAGE_TEXT_STYLE.hindi;
+  if (lang.includes('gujarati')) return LANGUAGE_TEXT_STYLE.gujarati;
+  if (lang.includes('english')) return LANGUAGE_TEXT_STYLE.english;
+  return LANGUAGE_TEXT_STYLE.default;
 }
 
 const SYSTEM_FONT_FALLBACKS = [
@@ -148,14 +190,29 @@ app.post('/render', async (req, res) => {
     const fontPath = fontForLanguage(language);
     const outputPath = path.join(OUTPUT_DIR, `reel-${jobId}.mp4`);
 
+    // All size/spacing decisions for this render's language live in one
+    // place. See LANGUAGE_TEXT_STYLE above for what each field controls.
+    const langStyle = getLanguageStyle(language);
+
+    const productFontSize = Math.round(BASE_FONTSIZE.product * langStyle.fontSizeScale.product);
+    const priceFontSize = Math.round(BASE_FONTSIZE.price * langStyle.fontSizeScale.price);
+    const taglineFontSize = Math.round(BASE_FONTSIZE.tagline * langStyle.fontSizeScale.tagline);
+
+    // Max characters per line for a given fontSize, using this language's
+    // charWidthRatio and safeWidthRatio so wrapping keeps text within a
+    // safe margin AND accounts for how wide this script's glyphs actually
+    // render (see comment on LANGUAGE_TEXT_STYLE).
+    function maxCharsForFontSize(fontSize) {
+      return Math.max(4, Math.floor((FRAME_WIDTH * langStyle.safeWidthRatio) / (fontSize * langStyle.charWidthRatio)));
+    }
+
     // Break long text onto multiple lines instead of letting it run off the
-    // left/right edges of the 1080px-wide frame. FFmpeg's drawtext has no
-    // built-in auto-wrap, so this breaks at the best word boundary before
-    // maxCharsPerLine is exceeded. Returns an ARRAY of lines (not a joined
-    // string) -- each line gets rendered as its own drawtext call later so
-    // it can be centered independently (see multilineTextFilter below).
-    // Caps at 2 lines total (anything beyond that gets merged onto line 2)
-    // since 3+ lines would start colliding with the other overlay elements.
+    // left/right edges of the frame. Returns an ARRAY of lines (not a
+    // joined string) -- each line gets rendered as its own drawtext call
+    // later so it can be centered independently (see multilineTextFilter
+    // below). Caps at 2 lines total (anything beyond that gets merged onto
+    // line 2) since 3+ lines would start colliding with the other overlay
+    // elements.
     function wrapText(text, maxCharsPerLine) {
       const words = String(text || '').split(' ').filter(Boolean);
       const lines = [];
@@ -189,9 +246,9 @@ app.post('/render', async (req, res) => {
       });
     }
 
-    const productLines = wrapText(product_name, maxCharsForFontSize(60));
-    const priceLines = wrapText(price, maxCharsForFontSize(80));
-    const taglineLines = wrapText(tagline, maxCharsForFontSize(46));
+    const productLines = wrapText(product_name, maxCharsForFontSize(productFontSize));
+    const priceLines = wrapText(price, maxCharsForFontSize(priceFontSize));
+    const taglineLines = wrapText(tagline, maxCharsForFontSize(taglineFontSize));
 
     const productLinePaths = writeTextLines(path.join(workDir, 'product_name'), productLines);
     const priceLinePaths = writeTextLines(path.join(workDir, 'price'), priceLines);
@@ -204,8 +261,7 @@ app.post('/render', async (req, res) => {
     // for the resting y (no quotes needed, e.g. '200' or '(h/2)-40').
     // x=(w-text_w)/2 centers THIS SINGLE LINE on its own width -- always
     // call this once per line (see multilineTextFilter), never with a
-    // multi-line textfile, or the centering breaks (see comment above
-    // wrapText).
+    // multi-line textfile, or the centering breaks.
     function animatedTextFilter(escapedTextfilePath, fontFileToUse, fontColor, fontSize, yFinalExpr, appearAt, animDur, slideDist) {
       const yExpr = `(${yFinalExpr})+${slideDist}*(1-min(max((t-${appearAt})/${animDur}\\,0)\\,1))`;
       const alphaExpr = `if(lt(t\\,${appearAt})\\,0\\,min((t-${appearAt})/${animDur}\\,1))`;
@@ -217,12 +273,11 @@ app.post('/render', async (req, res) => {
 
     // Builds one drawtext filter PER LINE (comma-joined) for a text block
     // that may wrap onto 1-2 lines, so every line is centered independently
-    // on its own width. The lines are stacked vertically around
-    // yCenterExpr (using lineHeight spacing) so the whole block still reads
-    // as one cohesive element, e.g. a 2-line headline stays visually
-    // grouped even though it's two separate drawtext calls under the hood.
-    function multilineTextFilter(linePaths, fontFileToUse, fontColor, fontSize, yCenterExpr, appearAt, animDur, slideDist) {
-      const lineHeight = fontSize * 1.15;
+    // on its own width. Lines are stacked vertically around yCenterExpr
+    // using lineHeightMultiplier (language-specific -- see
+    // LANGUAGE_TEXT_STYLE) so the block reads as one cohesive element.
+    function multilineTextFilter(linePaths, fontFileToUse, fontColor, fontSize, yCenterExpr, appearAt, animDur, slideDist, lineHeightMultiplier) {
+      const lineHeight = fontSize * lineHeightMultiplier;
       return linePaths.map((linePath, i) => {
         const lineOffset = (i - (linePaths.length - 1) / 2) * lineHeight;
         const yFinalExpr = `(${yCenterExpr})+(${lineOffset})`;
@@ -235,14 +290,14 @@ app.post('/render', async (req, res) => {
     // the middle (bold, YELLOW, largest), tagline near the bottom
     // (regular weight, white). Timing differs per mode per the
     // architecture card (Step 6A/6B/6C), so this is built fresh for
-    // whichever mode ends up rendering. Tagline fontsize bumped 40->46
-    // per feedback that it read too small next to the name/price.
+    // whichever mode ends up rendering. Font sizes and line-height come
+    // from langStyle, tuned per script (see LANGUAGE_TEXT_STYLE).
     function buildTextOverlay(nameAppearAt, priceAppearAt, taglineAppearAt) {
       if (!boldFontPath) return null;
       return [
-        multilineTextFilter(productLinePaths, boldFontPath, 'white', 60, '200', nameAppearAt, 0.6, 25),
-        multilineTextFilter(priceLinePaths, boldFontPath, 'yellow', 80, '(h/2)', priceAppearAt, 0.6, 25),
-        multilineTextFilter(taglineLinePaths, fontPath, 'white', 46, 'h-200', taglineAppearAt, 0.6, 20)
+        multilineTextFilter(productLinePaths, boldFontPath, 'white', productFontSize, '200', nameAppearAt, 0.6, 25, langStyle.lineHeightMultiplier),
+        multilineTextFilter(priceLinePaths, boldFontPath, 'yellow', priceFontSize, '(h/2)', priceAppearAt, 0.6, 25, langStyle.lineHeightMultiplier),
+        multilineTextFilter(taglineLinePaths, fontPath, 'white', taglineFontSize, 'h-200', taglineAppearAt, 0.6, 20, langStyle.lineHeightMultiplier)
       ].join(',');
     }
 
@@ -458,7 +513,7 @@ app.post('/render', async (req, res) => {
       durationSeconds: actualOutputDuration,
       fileSizeMB,
       modeUsed: modeStr,
-      serverVersion: 'v4-centered-text-fix'
+      serverVersion: 'v5-per-language-styling'
     });
   } catch (err) {
     console.error('Render failed:', err.stack || err.message || err);
@@ -467,7 +522,7 @@ app.post('/render', async (req, res) => {
   }
 });
 
-app.get('/health', (req, res) => res.json({ status: 'ok', version: 'v4-centered-text-fix' }));
+app.get('/health', (req, res) => res.json({ status: 'ok', version: 'v5-per-language-styling' }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`FFmpeg render server listening on port ${PORT}`));
