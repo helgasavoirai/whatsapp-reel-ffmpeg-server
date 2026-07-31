@@ -21,6 +21,22 @@ const MAX_FILE_SIZE_MB = 16;
 const TARGET_DURATION = 15;
 const FFMPEG_THREADS = '2';
 
+// Output frame is 1080px wide (see scale=1080:1920 / 1620:2880->crop below).
+// SAFE_WIDTH_RATIO reserves a margin on each side so text never touches the
+// video edges -- 0.86 means the usable text width is 86% of the frame,
+// i.e. ~7% margin left AND right.
+const FRAME_WIDTH = 1080;
+const SAFE_WIDTH_RATIO = 0.86;
+// Approx average glyph width as a fraction of fontSize for the Noto fonts
+// used here. Kept conservative (wider than a typical Latin estimate)
+// because Devanagari/Gujarati glyphs tend to render wider than Latin ones
+// at the same font size.
+const CHAR_WIDTH_RATIO = 0.62;
+
+function maxCharsForFontSize(fontSize) {
+  return Math.max(4, Math.floor((FRAME_WIDTH * SAFE_WIDTH_RATIO) / (fontSize * CHAR_WIDTH_RATIO)));
+}
+
 const SYSTEM_FONT_FALLBACKS = [
   '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
   '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
@@ -132,19 +148,14 @@ app.post('/render', async (req, res) => {
     const fontPath = fontForLanguage(language);
     const outputPath = path.join(OUTPUT_DIR, `reel-${jobId}.mp4`);
 
-    const productTextPath = path.join(workDir, 'product_name.txt');
-    const priceTextPath = path.join(workDir, 'price.txt');
-    const taglineTextPath = path.join(workDir, 'tagline.txt');
-
-    // Wrap long text onto a second line instead of letting it run off the
+    // Break long text onto multiple lines instead of letting it run off the
     // left/right edges of the 1080px-wide frame. FFmpeg's drawtext has no
     // built-in auto-wrap, so this breaks at the best word boundary before
-    // maxCharsPerLine is exceeded. maxCharsPerLine is a rough estimate
-    // (character width ~0.65x fontSize for these fonts, with margin) --
-    // conservative on purpose since Devanagari/Gujarati glyphs tend to be
-    // wider than Latin ones at the same font size. Caps at 2 lines total
-    // (anything beyond that gets merged onto line 2) since 3+ lines would
-    // start colliding with the other overlay elements.
+    // maxCharsPerLine is exceeded. Returns an ARRAY of lines (not a joined
+    // string) -- each line gets rendered as its own drawtext call later so
+    // it can be centered independently (see multilineTextFilter below).
+    // Caps at 2 lines total (anything beyond that gets merged onto line 2)
+    // since 3+ lines would start colliding with the other overlay elements.
     function wrapText(text, maxCharsPerLine) {
       const words = String(text || '').split(' ').filter(Boolean);
       const lines = [];
@@ -160,34 +171,63 @@ app.post('/render', async (req, res) => {
       }
       if (current) lines.push(current);
       if (lines.length > 2) {
-        return [lines[0], lines.slice(1).join(' ')].join('\n');
+        return [lines[0], lines.slice(1).join(' ')];
       }
-      return lines.join('\n');
+      return lines.length ? lines : [''];
     }
 
-    fs.writeFileSync(productTextPath, wrapText(product_name, 20));   // fontsize 60
-    fs.writeFileSync(priceTextPath, wrapText(price, 15));            // fontsize 80
-    fs.writeFileSync(taglineTextPath, wrapText(tagline, 26));        // fontsize 46
-    const escapedProductPath = escapePath(productTextPath);
-    const escapedPricePath = escapePath(priceTextPath);
-    const escapedTaglinePath = escapePath(taglineTextPath);
+    // Writes each line of a wrapped text block to its own textfile (rather
+    // than one file with embedded \n). This is what lets each line get its
+    // own independent drawtext call, so each is centered on ITS OWN width
+    // instead of all lines sharing one x-offset computed from the widest
+    // line (which is what made short lines look left-shifted before).
+    function writeTextLines(basePath, lines) {
+      return lines.map((line, i) => {
+        const p = `${basePath}_l${i}.txt`;
+        fs.writeFileSync(p, line);
+        return escapePath(p);
+      });
+    }
+
+    const productLines = wrapText(product_name, maxCharsForFontSize(60));
+    const priceLines = wrapText(price, maxCharsForFontSize(80));
+    const taglineLines = wrapText(tagline, maxCharsForFontSize(46));
+
+    const productLinePaths = writeTextLines(path.join(workDir, 'product_name'), productLines);
+    const priceLinePaths = writeTextLines(path.join(workDir, 'price'), priceLines);
+    const taglineLinePaths = writeTextLines(path.join(workDir, 'tagline'), taglineLines);
 
     const boldFontPath = boldFontForLanguage(language);
 
     // One drawtext line, animated (fade + slight slide) into its resting
     // position starting at appearAt. yFinalExpr is a raw ffmpeg expression
     // for the resting y (no quotes needed, e.g. '200' or '(h/2)-40').
-    // x=(w-text_w)/2 centers EACH line independently when the textfile
-    // contains a literal newline (ffmpeg recalculates text_w per line for
-    // multi-line drawtext), so wrapped 2-line text stays centered exactly
-    // like single-line text.
-    function animatedTextFilter(textfilePath, fontFileToUse, fontColor, fontSize, yFinalExpr, appearAt, animDur, slideDist) {
+    // x=(w-text_w)/2 centers THIS SINGLE LINE on its own width -- always
+    // call this once per line (see multilineTextFilter), never with a
+    // multi-line textfile, or the centering breaks (see comment above
+    // wrapText).
+    function animatedTextFilter(escapedTextfilePath, fontFileToUse, fontColor, fontSize, yFinalExpr, appearAt, animDur, slideDist) {
       const yExpr = `(${yFinalExpr})+${slideDist}*(1-min(max((t-${appearAt})/${animDur}\\,0)\\,1))`;
       const alphaExpr = `if(lt(t\\,${appearAt})\\,0\\,min((t-${appearAt})/${animDur}\\,1))`;
-      return `drawtext=fontfile='${fontFileToUse}':textfile='${textfilePath}':fontcolor=${fontColor}:fontsize=${fontSize}:` +
+      return `drawtext=fontfile='${fontFileToUse}':textfile='${escapedTextfilePath}':fontcolor=${fontColor}:fontsize=${fontSize}:` +
         `x=(w-text_w)/2:y='${yExpr}':` +
         `borderw=3:bordercolor=black@0.85:shadowcolor=black@0.6:shadowx=2:shadowy=2:` +
         `alpha='${alphaExpr}'`;
+    }
+
+    // Builds one drawtext filter PER LINE (comma-joined) for a text block
+    // that may wrap onto 1-2 lines, so every line is centered independently
+    // on its own width. The lines are stacked vertically around
+    // yCenterExpr (using lineHeight spacing) so the whole block still reads
+    // as one cohesive element, e.g. a 2-line headline stays visually
+    // grouped even though it's two separate drawtext calls under the hood.
+    function multilineTextFilter(linePaths, fontFileToUse, fontColor, fontSize, yCenterExpr, appearAt, animDur, slideDist) {
+      const lineHeight = fontSize * 1.15;
+      return linePaths.map((linePath, i) => {
+        const lineOffset = (i - (linePaths.length - 1) / 2) * lineHeight;
+        const yFinalExpr = `(${yCenterExpr})+(${lineOffset})`;
+        return animatedTextFilter(linePath, fontFileToUse, fontColor, fontSize, yFinalExpr, appearAt, animDur, slideDist);
+      }).join(',');
     }
 
     // Per the Trello FFmpeg command references (Mode 1 & Mode 2 cards):
@@ -200,9 +240,9 @@ app.post('/render', async (req, res) => {
     function buildTextOverlay(nameAppearAt, priceAppearAt, taglineAppearAt) {
       if (!boldFontPath) return null;
       return [
-        animatedTextFilter(escapedProductPath, boldFontPath, 'white', 60, '200', nameAppearAt, 0.6, 25),
-        animatedTextFilter(escapedPricePath, boldFontPath, 'yellow', 80, '(h/2)', priceAppearAt, 0.6, 25),
-        animatedTextFilter(escapedTaglinePath, fontPath, 'white', 46, 'h-200', taglineAppearAt, 0.6, 20)
+        multilineTextFilter(productLinePaths, boldFontPath, 'white', 60, '200', nameAppearAt, 0.6, 25),
+        multilineTextFilter(priceLinePaths, boldFontPath, 'yellow', 80, '(h/2)', priceAppearAt, 0.6, 25),
+        multilineTextFilter(taglineLinePaths, fontPath, 'white', 46, 'h-200', taglineAppearAt, 0.6, 20)
       ].join(',');
     }
 
@@ -418,7 +458,7 @@ app.post('/render', async (req, res) => {
       durationSeconds: actualOutputDuration,
       fileSizeMB,
       modeUsed: modeStr,
-      serverVersion: 'v3-mode2-slideshow'
+      serverVersion: 'v4-centered-text-fix'
     });
   } catch (err) {
     console.error('Render failed:', err.stack || err.message || err);
@@ -427,7 +467,7 @@ app.post('/render', async (req, res) => {
   }
 });
 
-app.get('/health', (req, res) => res.json({ status: 'ok', version: 'v3-mode2-slideshow' }));
+app.get('/health', (req, res) => res.json({ status: 'ok', version: 'v4-centered-text-fix' }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`FFmpeg render server listening on port ${PORT}`));
