@@ -165,9 +165,9 @@ app.post('/render', async (req, res) => {
       return lines.join('\n');
     }
 
-    fs.writeFileSync(productTextPath, wrapText(product_name, 24));   // fontsize 60
-    fs.writeFileSync(priceTextPath, wrapText(price, 18));            // fontsize 80
-    fs.writeFileSync(taglineTextPath, wrapText(tagline, 34));        // fontsize 46
+    fs.writeFileSync(productTextPath, wrapText(product_name, 20));   // fontsize 60
+    fs.writeFileSync(priceTextPath, wrapText(price, 15));            // fontsize 80
+    fs.writeFileSync(taglineTextPath, wrapText(tagline, 26));        // fontsize 46
     const escapedProductPath = escapePath(productTextPath);
     const escapedPricePath = escapePath(priceTextPath);
     const escapedTaglinePath = escapePath(taglineTextPath);
